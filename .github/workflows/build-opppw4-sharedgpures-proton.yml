@@ -1,0 +1,178 @@
+name: Build OPPW4 sharedgpures Proton
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-arm64ec-sdk35:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h
+
+      - name: Install host build dependencies
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential git wget curl unzip xz-utils zstd file \
+            flex bison gettext autoconf automake libtool pkg-config \
+            mingw-w64 gcc-multilib g++-multilib \
+            libfreetype6-dev libfreetype6-dev:i386 \
+            libpng-dev libpng-dev:i386 zlib1g-dev zlib1g-dev:i386
+
+      - name: Clone Bannerlator Proton 10 source
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 --branch proton_10.0 \
+            https://github.com/The412Banner/proton-wine.git "$GITHUB_WORKSPACE/proton-src"
+          cd "$GITHUB_WORKSPACE/proton-src"
+          echo "SOURCE_COMMIT=$(git rev-parse HEAD)" | tee "$GITHUB_WORKSPACE/build-source.txt"
+          test -f dlls/sharedgpures.sys/shared_resource.c
+
+      - name: Apply sharedgpures PR 312 and 313 fixes
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/proton-src"
+
+          curl -fL --retry 3 \
+            'https://github.com/avafloww/wine/commit/1c778c07af61870fb693d49c2b1b45ebff91384f.patch' \
+            -o /tmp/sharedgpures-312.patch
+          curl -fL --retry 3 \
+            'https://github.com/avafloww/wine/commit/63d1363133c17cbf63f75591cafc61484de54955.patch' \
+            -o /tmp/sharedgpures-313.patch
+
+          git apply --check /tmp/sharedgpures-312.patch
+          git apply /tmp/sharedgpures-312.patch
+          git apply --check /tmp/sharedgpures-313.patch
+          git apply /tmp/sharedgpures-313.patch
+
+          grep -q 'unix_resource_khandle' dlls/sharedgpures.sys/shared_resource.c
+          grep -q 'NtDuplicateObject(NtCurrentProcess(), kernel_handle, client_process' dlls/sharedgpures.sys/shared_resource.c
+          grep -q 'FsContext = (void \*)(UINT_PTR)-1' dlls/sharedgpures.sys/shared_resource.c
+          grep -q 'FsContext == (UINT_PTR)-1' dlls/sharedgpures.sys/shared_resource.c
+
+          git diff -- dlls/sharedgpures.sys/shared_resource.c | tee "$GITHUB_WORKSPACE/sharedgpures-applied.diff"
+
+      - name: Download Termux ARM64 sysroot
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/termuxfs/aarch64"
+          cd "$HOME/termuxfs/aarch64"
+          wget -q --show-progress \
+            https://github.com/GameNative/termux-on-gha/releases/download/build-20260218/termuxfs-aarch64.tar
+          tar -xf termuxfs-aarch64.tar
+
+      - name: Set up Android NDK r27d
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/Android/Sdk/ndk"
+          cd "$HOME/Android/Sdk/ndk"
+          wget -q --show-progress https://dl.google.com/android/repository/android-ndk-r27d-linux.zip
+          unzip -q android-ndk-r27d-linux.zip
+          mv android-ndk-r27d 27.3.13750724
+
+      - name: Set up LLVM-MinGW ARM64EC toolchain
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/toolchains"
+          cd "$HOME/toolchains"
+          wget -q --show-progress \
+            https://github.com/bylaws/llvm-mingw/releases/download/20250920/llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64.tar.xz
+          tar -xf llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64.tar.xz
+
+      - name: Generate configure files and wine-tools
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/proton-src"
+          bash autogen.sh --aarch64
+          bash build-scripts/build-step0.sh
+
+      - name: Configure ARM64EC SDK35 / 16KB
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/proton-src"
+          bash build-scripts/build-step-arm64ec.sh --build-sysvshm
+          bash build-scripts/build-step-arm64ec.sh --enable-16kb-pages --configure
+
+      - name: Build and install ARM64EC Proton
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/proton-src"
+          bash build-scripts/build-step-arm64ec.sh --enable-16kb-pages --build
+          bash build-scripts/build-step-arm64ec.sh --enable-16kb-pages --install
+
+      - name: Locate and verify patched sharedgpures.sys
+        run: |
+          set -euxo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/out"
+
+          DRIVER="$(find "$HOME/compiled-files-aarch64" "$GITHUB_WORKSPACE/proton-src" \
+            -type f -iname 'sharedgpures.sys' -print -quit)"
+          test -n "$DRIVER"
+          cp "$DRIVER" "$GITHUB_WORKSPACE/out/sharedgpures-patched-arm64ec.sys"
+
+          file "$DRIVER" | tee "$GITHUB_WORKSPACE/out/sharedgpures-file.txt"
+          sha256sum "$DRIVER" | tee "$GITHUB_WORKSPACE/out/sharedgpures-sha256.txt"
+          strings -a "$DRIVER" | grep -Ei 'sharedgpu|SharedGpuResource|NtDuplicateObject|kernel handle|resource' \
+            | head -200 | tee "$GITHUB_WORKSPACE/out/sharedgpures-strings.txt" || true
+
+      - name: Download Proton 10 ARM64EC prefix pack
+        run: |
+          set -euxo pipefail
+          wget -q --show-progress \
+            https://github.com/GameNative/bionic-prefix-files/raw/main/prefixPack-arm64ec.txz \
+            -O "$GITHUB_WORKSPACE/prefixPack.txz"
+
+      - name: Package Bannerlator test WCP
+        run: |
+          set -euxo pipefail
+          OUTPUT_DIR="$HOME/compiled-files-aarch64"
+          cd "$OUTPUT_DIR"
+
+          cp "$GITHUB_WORKSPACE/prefixPack.txz" .
+          cat > profile.json <<'EOF'
+          {
+            "type": "Proton",
+            "versionName": "10.0-4-arm64ec-opppw4-sharedgpures",
+            "versionCode": 91,
+            "description": "EXPERIMENTAL OPPW4 build: Proton 10.0-4 ARM64EC SDK35 with Valve sharedgpures PR 312 + 313 fixes. Keep separate from normal containers.",
+            "files": [],
+            "wine": {
+              "binPath": "bin",
+              "libPath": "lib",
+              "prefixPack": "prefixPack.txz"
+            }
+          }
+          EOF
+
+          tar -I 'zstd -T0 -15' -cf \
+            "$GITHUB_WORKSPACE/out/proton-10.0-4-arm64ec-opppw4-sharedgpures-sdk35.wcp" \
+            bin lib share prefixPack.txz profile.json
+
+          sha256sum "$GITHUB_WORKSPACE/out/proton-10.0-4-arm64ec-opppw4-sharedgpures-sdk35.wcp" \
+            | tee "$GITHUB_WORKSPACE/out/wcp-sha256.txt"
+          ls -lh "$GITHUB_WORKSPACE/out/proton-10.0-4-arm64ec-opppw4-sharedgpures-sdk35.wcp"
+
+      - name: Upload patched Proton WCP
+        uses: actions/upload-artifact@v4
+        with:
+          name: opppw4-patched-proton-arm64ec-sdk35
+          path: |
+            out/proton-10.0-4-arm64ec-opppw4-sharedgpures-sdk35.wcp
+            out/wcp-sha256.txt
+            out/sharedgpures-patched-arm64ec.sys
+            out/sharedgpures-file.txt
+            out/sharedgpures-sha256.txt
+            out/sharedgpures-strings.txt
+            sharedgpures-applied.diff
+            build-source.txt
+          if-no-files-found: error
+          retention-days: 14

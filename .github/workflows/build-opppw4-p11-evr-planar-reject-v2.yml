@@ -1,0 +1,181 @@
+name: Build OPPW4 Proton 11 EVR planar reject test v2
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-opppw4-p11-evr-planar-reject-v2.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-arm64ec-sdk35:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h
+
+      - name: Install host build dependencies
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential git wget curl unzip xz-utils zstd file ccache \
+            flex bison gettext autoconf automake libtool pkg-config \
+            mingw-w64 gcc-multilib g++-multilib \
+            libfreetype6-dev libfreetype6-dev:i386 \
+            libpng-dev libpng-dev:i386 zlib1g-dev zlib1g-dev:i386
+
+      - name: Clone GE Proton 11 bionic source
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 --branch ge-proton11-bionic --recurse-submodules --shallow-submodules \
+            https://github.com/The412Banner/proton-wine.git "$GITHUB_WORKSPACE/proton-src"
+          cd "$GITHUB_WORKSPACE/proton-src"
+          git rev-parse HEAD | tee "$GITHUB_WORKSPACE/p11-source-commit.txt"
+
+      - name: Patch EVR negotiation to reject unsupported planar formats
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/proton-src"
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('dlls/evr/evr.c')
+          s = p.read_text()
+          anchor = '''            /* TODO: some pin -> mixer input mapping is necessary to test the substreams. */
+              if (SUCCEEDED(hr = IMFTransform_SetInputType(filter->mixer, 0, media_type, MFT_SET_TYPE_TEST_ONLY)))'''
+          # Be tolerant of source indentation changes: locate the two semantic lines instead.
+          comment = '/* TODO: some pin -> mixer input mapping is necessary to test the substreams. */'
+          call = 'if (SUCCEEDED(hr = IMFTransform_SetInputType(filter->mixer, 0, media_type, MFT_SET_TYPE_TEST_ONLY)))'
+          ci = s.find(comment)
+          if ci < 0:
+              raise SystemExit('TODO anchor not found')
+          li = s.rfind('\n', 0, ci) + 1
+          next_line_start = s.find('\n', ci) + 1
+          call_i = s.find(call, next_line_start)
+          if call_i < 0 or call_i - next_line_start > 64:
+              raise SystemExit('SetInputType anchor not found next to TODO')
+          indent = s[next_line_start:call_i]
+          replacement = f'''GUID oppw4_subtype = {{0}};\n\n{indent}/* OPPW4 diagnostic: evr_render() only copies ARGB32/RGB32/YUY2/NV12.\n{indent} * Reject planar I420/IYUV/YV12 here so the graph can negotiate NV12/YUY2. */\n{indent}if (SUCCEEDED(IMFMediaType_GetGUID(media_type, &MF_MT_SUBTYPE, &oppw4_subtype))\n{indent}        && (IsEqualGUID(&oppw4_subtype, &MFVideoFormat_I420)\n{indent}            || IsEqualGUID(&oppw4_subtype, &MFVideoFormat_IYUV)\n{indent}            || IsEqualGUID(&oppw4_subtype, &MFVideoFormat_YV12)))\n{indent}{{\n{indent}    WARN("OPPW4 diagnostic: rejecting unsupported planar EVR subtype %s.\\n", debugstr_guid(&oppw4_subtype));\n{indent}    hr = MF_E_INVALIDMEDIATYPE;\n{indent}}}\n{indent}else {call}'''
+          # Replace from comment through the original if condition, preserving the if body braces below.
+          s = s[:ci] + replacement + s[call_i + len(call):]
+          p.write_text(s)
+          PY
+          grep -n -A32 -B5 'OPPW4 diagnostic: evr_render' dlls/evr/evr.c | tee "$GITHUB_WORKSPACE/evr-planar-patch.txt"
+          grep -q 'MFVideoFormat_I420' "$GITHUB_WORKSPACE/evr-planar-patch.txt"
+          grep -q 'MF_E_INVALIDMEDIATYPE' "$GITHUB_WORKSPACE/evr-planar-patch.txt"
+
+      - name: Download Termux ARM64 sysroot
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/termuxfs/aarch64"
+          cd "$HOME/termuxfs/aarch64"
+          wget -q --show-progress https://github.com/GameNative/termux-on-gha/releases/download/build-20260218/termuxfs-aarch64.tar
+          tar -xf termuxfs-aarch64.tar
+
+      - name: Set up Android NDK r27d
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/Android/Sdk/ndk"
+          cd "$HOME/Android/Sdk/ndk"
+          wget -q --show-progress https://dl.google.com/android/repository/android-ndk-r27d-linux.zip
+          unzip -q android-ndk-r27d-linux.zip
+          mv android-ndk-r27d 27.3.13750724
+
+      - name: Set up LLVM-MinGW ARM64EC toolchain
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/toolchains"
+          cd "$HOME/toolchains"
+          wget -q --show-progress https://github.com/bylaws/llvm-mingw/releases/download/20250920/llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64.tar.xz
+          tar -xf llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64.tar.xz
+
+      - name: Autogen Proton 11
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/proton-src"
+          bash build-scripts/build-step0-autogen.sh
+          test -x ./configure
+
+      - name: Build wine-tools
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/proton-src"
+          bash build-scripts/build-step0.sh
+          test -d wine-tools
+
+      - name: Configure ARM64EC SDK35 / 16KB
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/proton-src"
+          bash build-scripts/build-step-arm64ec.sh --build-sysvshm
+          bash build-scripts/build-step-arm64ec.sh --enable-16kb-pages --configure
+
+      - name: Build and install Proton 11 ARM64EC
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/proton-src"
+          bash build-scripts/build-step-arm64ec.sh --enable-16kb-pages --build
+          bash build-scripts/build-step-arm64ec.sh --enable-16kb-pages --install
+
+      - name: Verify EVR payload exists
+        run: |
+          set -euxo pipefail
+          OUTPUT_DIR="$HOME/compiled-files-aarch64"
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          find "$OUTPUT_DIR" -type f -iname 'evr*' -print | sort | tee "$GITHUB_WORKSPACE/out/evr-files.txt"
+          test "$(find "$OUTPUT_DIR" -type f -iname 'evr*' | wc -l)" -gt 0
+          find "$OUTPUT_DIR" -type f -iname 'evr*' -exec sha256sum {} \; | tee "$GITHUB_WORKSPACE/out/evr-sha256.txt"
+
+      - name: Download Proton 11 ARM64EC prefix pack
+        run: |
+          set -euxo pipefail
+          wget -q --show-progress \
+            https://github.com/GameNative/bionic-prefix-files/raw/main/prefixPack-arm64ec-11.txz \
+            -O "$GITHUB_WORKSPACE/prefixPack.txz"
+
+      - name: Package Bannerlator EVR test WCP
+        run: |
+          set -euxo pipefail
+          OUTPUT_DIR="$HOME/compiled-files-aarch64"
+          cd "$OUTPUT_DIR"
+          cp "$GITHUB_WORKSPACE/prefixPack.txz" .
+          cat > profile.json <<'EOF'
+          {
+            "type": "Proton",
+            "versionName": "11.0.3.2-arm64ec",
+            "versionCode": 5,
+            "description": "OPPW4 EVR PLANAR TEST v2: Proton 11 ARM64EC SDK35/16KB. Rejects I420/IYUV/YV12 during EVR input negotiation to force NV12/YUY2.",
+            "files": [],
+            "wine": {
+              "binPath": "bin",
+              "libPath": "lib",
+              "prefixPack": "prefixPack.txz"
+            }
+          }
+          EOF
+          tar -I 'zstd -T0 -15' -cf "$GITHUB_WORKSPACE/out/proton-11.0.3.2-arm64ec-opppw4-evr-planar-sdk35.wcp" \
+            bin lib share prefixPack.txz profile.json
+          sha256sum "$GITHUB_WORKSPACE/out/proton-11.0.3.2-arm64ec-opppw4-evr-planar-sdk35.wcp" \
+            | tee "$GITHUB_WORKSPACE/out/wcp-sha256.txt"
+          ls -lh "$GITHUB_WORKSPACE/out/proton-11.0.3.2-arm64ec-opppw4-evr-planar-sdk35.wcp"
+
+      - name: Upload OPPW4 P11 EVR planar test Proton
+        uses: actions/upload-artifact@v4
+        with:
+          name: opppw4-p11-evr-planar-v2-arm64ec-sdk35
+          path: |
+            out/proton-11.0.3.2-arm64ec-opppw4-evr-planar-sdk35.wcp
+            out/wcp-sha256.txt
+            out/evr-files.txt
+            out/evr-sha256.txt
+            p11-source-commit.txt
+            evr-planar-patch.txt
+          if-no-files-found: error
+          retention-days: 14

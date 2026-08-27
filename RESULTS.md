@@ -47,21 +47,44 @@ Interpretation:
 - The remaining failure is now likely **after shared-resource metadata/open succeeds**: actual shared image contents, visibility/synchronization, or a video-surface/format-specific path.
 - Do not return to codec/MF experiments.
 
-### Next diagnostic
+### Standalone D3D9 -> D3D11 shared-texture verifier
 
-A standalone Windows x64 verifier was added to `tests/d3d9_d3d11_share_test.cpp` with workflow `Build OPPW4 D3D9-D3D11 share verifier`.
+The standalone verifier (`tests/d3d9_d3d11_share_test.cpp`) was run inside the same Proton 11 + DXVK 3.0.2 container.
 
-It performs a direct D3D9Ex -> D3D11 shared-texture test independent of OPPW4/Media Foundation:
+Result: **PASS**.
 
-1. Creates a shared D3D9 render-target texture.
-2. Opens the same handle through D3D11.
-3. Writes three colors from D3D9.
-4. Verifies the producer pixels through D3D9 readback.
-5. Verifies the consumer pixels through D3D11 readback after each update.
+Observed details:
 
-Possible results:
+- D3D9 shared texture creation succeeded.
+- D3D11 `OpenSharedResource` succeeded for handle `0x40000002`.
+- MAGENTA, GREEN and CYAN writes made by D3D9 were read back correctly through both D3D9 and D3D11.
+- Therefore ordinary D3D9-created -> D3D11-opened shared-image contents and visibility work in this stack.
 
-- `PASS`: generic D3D9 -> D3D11 shared image contents work; focus next on the media/video-specific surface path (NV12/conversion/synchronization).
-- `SHARE_CONTENT_FAIL`: the shared handle opens but the D3D11 side does not see D3D9 writes; confirms a lower shared-memory/visibility/synchronization defect.
-- `OPEN_FAIL`: shared-resource opening is still failing in the generic path.
-- `PRODUCER_FAIL`: D3D9 itself failed to create/write/read the test resource.
+This closes the hypothesis that generic D3D9 -> D3D11 shared memory is fundamentally broken.
+
+### Important directionality finding after PASS
+
+The verifier tested **D3D9 creates the resource -> D3D11 opens it**.
+
+The Media Foundation / D3D9 device-manager path used by OPPW4 may exercise the reverse import direction: **D3D11-created resource -> D3D9 imports/validates/writes it -> D3D11 consumes it**.
+
+Very recent upstream DXVK commit `d647fdf3c554ba917f88e01374602e06f664491d` (2026-08-26), titled:
+
+`[d3d9] Pass validation for imported D3D11 textures.`
+
+changes `D3D9DeviceEx::ValidateSharedTexture` specifically so D3D9 accepts D3D11 runtime descriptors (`version == 4`) instead of rejecting them as invalid D3D9 descriptors.
+
+That commit is newer than DXVK 3.0.2 and is therefore absent from the tested stable WCP.
+
+A targeted ARM64EC DXVK build workflow has been added:
+
+`.github/workflows/build-dxvk-opppw4-imported-d3d11.yml`
+
+It pins exactly commit `d647fdf3...` and packages it as an experimental `dxvk-arm64ec-3.0.99.wcp` for a one-variable A/B test against DXVK 3.0.2.
+
+Next device test after the build succeeds:
+
+1. Keep the same diagnostic Proton 11 container.
+2. Keep Wrapper, Turnip, VKD3D, resolution and game files unchanged.
+3. Change only DXVK 3.0.2 -> targeted `3.0.99` build.
+4. Re-test the same Gallery cutscene.

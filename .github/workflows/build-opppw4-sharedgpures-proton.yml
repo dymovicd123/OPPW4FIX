@@ -31,11 +31,13 @@ jobs:
       - name: Clone Bannerlator Proton 10 source
         run: |
           set -euxo pipefail
-          git clone --depth 1 --branch proton_10.0 \
+          git clone --depth 1 --branch proton_10.0 --recurse-submodules --shallow-submodules \
             https://github.com/The412Banner/proton-wine.git "$GITHUB_WORKSPACE/proton-src"
           cd "$GITHUB_WORKSPACE/proton-src"
+          git submodule status --recursive
           echo "SOURCE_COMMIT=$(git rev-parse HEAD)" | tee "$GITHUB_WORKSPACE/build-source.txt"
           test -f dlls/sharedgpures.sys/shared_resource.c
+          test -f dlls/winedirectaudio.drv/directaudio.c
 
       - name: Apply sharedgpures PR 312 and 313 fixes
         run: |
@@ -88,12 +90,19 @@ jobs:
             https://github.com/bylaws/llvm-mingw/releases/download/20250920/llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64.tar.xz
           tar -xf llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64.tar.xz
 
-      - name: Generate configure files and wine-tools
+      - name: Generate configure files
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/proton-src"
           bash autogen.sh --aarch64
+          test -x ./configure
+
+      - name: Build wine-tools
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/proton-src"
           bash build-scripts/build-step0.sh
+          test -d wine-tools
 
       - name: Configure ARM64EC SDK35 / 16KB
         run: |

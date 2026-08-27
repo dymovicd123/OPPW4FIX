@@ -1,0 +1,85 @@
+name: Build OPPW4 DXVK imported-D3D11 diagnostic
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-dxvk-opppw4-imported-d3d11.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-arm64ec:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    env:
+      DXVK_TARGET_SHA: d647fdf3c554ba917f88e01374602e06f664491d
+      WCPHUB_SHA: 1e1016bd8f63ddda1f23ca524e2248d3fa93f046
+      EXPERIMENT_VERSION: 3.0.99
+
+    steps:
+      - name: Checkout OPPW4FIX
+        uses: actions/checkout@v4
+
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h
+
+      - name: Clone pinned WCPHub
+        run: |
+          git clone https://github.com/Arihany/WinlatorWCPHub.git wcphub
+          git -C wcphub checkout "$WCPHUB_SHA"
+          git -C wcphub rev-parse HEAD
+
+      - name: Seed DXVK source at targeted commit
+        run: |
+          git clone https://github.com/doitsujin/dxvk.git wcphub/src
+          git -C wcphub/src fetch origin "$DXVK_TARGET_SHA"
+          git -C wcphub/src tag -f "v${EXPERIMENT_VERSION}" "$DXVK_TARGET_SHA"
+          echo "Target DXVK commit: $(git -C wcphub/src rev-parse v${EXPERIMENT_VERSION}^{commit})"
+          git -C wcphub/src show -s --format='%H%n%s%n%ci' "v${EXPERIMENT_VERSION}"
+          git -C wcphub/src show "$DXVK_TARGET_SHA" -- src/d3d9/d3d9_device.cpp > dxvk-target-commit.diff
+          grep -F 'Found D3D11 texture, skipping validation.' dxvk-target-commit.diff
+
+      - name: Build ARM64EC DXVK WCP
+        working-directory: wcphub
+        run: |
+          bash scripts/local-build.sh --setup --kind dxvk-arm64ec --versions "$EXPERIMENT_VERSION"
+          ls -lh out
+
+      - name: Verify WCP exists
+        run: |
+          test -f "wcphub/out/dxvk-arm64ec-${EXPERIMENT_VERSION}.wcp"
+          sha256sum "wcphub/out/dxvk-arm64ec-${EXPERIMENT_VERSION}.wcp" | tee dxvk-wcp.sha256
+          printf '%s\n' "$DXVK_TARGET_SHA" > dxvk-target-sha.txt
+          cat > TEST-INSTRUCTIONS.txt <<'EOF'
+OPPW4 targeted DXVK test
+
+Purpose:
+Test DXVK commit d647fdf3c554ba917f88e01374602e06f664491d:
+[d3d9] Pass validation for imported D3D11 textures.
+
+This is specifically relevant to the reverse sharing direction used by media pipelines where a D3D11-created texture is imported into D3D9 for decoding/writing.
+
+Use with the same diagnostic Proton 11 container that already ran OPPW4 with DXVK 3.0.2.
+Change only DXVK to this experimental WCP.
+Keep Wrapper, Turnip, VKD3D, resolution and game files unchanged.
+Re-test the same Gallery cutscene.
+EOF
+
+      - name: Upload targeted DXVK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: opppw4-dxvk-arm64ec-imported-d3d11-d647fdf
+          path: |
+            wcphub/out/dxvk-arm64ec-3.0.99.wcp
+            dxvk-target-commit.diff
+            dxvk-target-sha.txt
+            dxvk-wcp.sha256
+            TEST-INSTRUCTIONS.txt
+          if-no-files-found: error
+          retention-days: 14

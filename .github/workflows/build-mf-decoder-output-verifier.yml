@@ -1,0 +1,40 @@
+name: Build OPPW4 MF decoder output verifier
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'tests/mf_decoder_output_test.cpp'
+      - '.github/workflows/build-mf-decoder-output-verifier.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-x64:
+    runs-on: windows-2025
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC x64
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build verifier
+        shell: cmd
+        run: |
+          if not exist out mkdir out
+          cl /nologo /std:c++17 /EHsc /O2 /W4 tests\mf_decoder_output_test.cpp /Fe:out\opppw4-mf-decoder-output-test-x64.exe /link mfplat.lib mfreadwrite.lib mfuuid.lib ole32.lib comdlg32.lib user32.lib
+
+      - name: Upload verifier
+        uses: actions/upload-artifact@v4
+        with:
+          name: opppw4-mf-decoder-output-verifier-x64
+          path: out/opppw4-mf-decoder-output-test-x64.exe
+          if-no-files-found: error
+          retention-days: 14

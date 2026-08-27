@@ -1,0 +1,265 @@
+name: Build OPPW4 Proton 11 EVR mixer presenter trace v4
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-opppw4-p11-evr-trace-v4.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-arm64ec-sdk35:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h
+
+      - name: Install host build dependencies
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential git wget curl unzip xz-utils zstd file ccache \
+            flex bison gettext autoconf automake libtool pkg-config \
+            mingw-w64 gcc-multilib g++-multilib \
+            libfreetype6-dev libfreetype6-dev:i386 \
+            libpng-dev libpng-dev:i386 zlib1g-dev zlib1g-dev:i386
+
+      - name: Clone GE Proton 11 bionic source
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 --branch ge-proton11-bionic --recurse-submodules --shallow-submodules \
+            https://github.com/The412Banner/proton-wine.git "$GITHUB_WORKSPACE/proton-src"
+          cd "$GITHUB_WORKSPACE/proton-src"
+          git rev-parse HEAD | tee "$GITHUB_WORKSPACE/p11-source-commit.txt"
+
+      - name: Instrument EVR DLL mixer and presenter
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/proton-src"
+          python3 - <<'PY'
+          from pathlib import Path
+
+          # main.c: prove the patched EVR DLL is actually loaded and show requested classes.
+          p = Path('dlls/evr/main.c')
+          s = p.read_text()
+          old = '''    case DLL_PROCESS_ATTACH:\n        DisableThreadLibraryCalls(instance);'''
+          new = '''    case DLL_PROCESS_ATTACH:\n        ERR("OPPW4TRACE EVR_DLL_LOADED v4 instance=%p.\\n", instance);\n        DisableThreadLibraryCalls(instance);'''
+          if old not in s:
+              raise SystemExit('main DllMain anchor not found')
+          s = s.replace(old, new, 1)
+          old = '''HRESULT WINAPI DllGetClassObject(REFCLSID rclsid, REFIID riid, void **out)\n{\n    struct class_factory *factory;'''
+          new = '''HRESULT WINAPI DllGetClassObject(REFCLSID rclsid, REFIID riid, void **out)\n{\n    static unsigned int oppw4_class_count;\n    struct class_factory *factory;\n    if (++oppw4_class_count <= 40)\n        ERR("OPPW4TRACE EVR_CLASS #%u clsid=%s riid=%s.\\n", oppw4_class_count, debugstr_guid(rclsid), debugstr_guid(riid));'''
+          if old not in s:
+              raise SystemExit('DllGetClassObject anchor not found')
+          s = s.replace(old, new, 1)
+          p.write_text(s)
+
+          # mixer.c: inspect Media Foundation mixer input bytes and VideoProcessBlt result.
+          p = Path('dlls/evr/mixer.c')
+          s = p.read_text()
+          sig = 'static HRESULT WINAPI video_mixer_transform_ProcessInput(IMFTransform *iface, DWORD id, IMFSample *sample, DWORD flags)\n{'
+          pos = s.find(sig)
+          if pos < 0:
+              raise SystemExit('mixer ProcessInput signature not found')
+          needle = '    HRESULT hr;\n'
+          n = s.find(needle, pos)
+          if n < 0:
+              raise SystemExit('mixer ProcessInput declaration anchor not found')
+          insert = '''    static unsigned int oppw4_mixer_input_count;\n    unsigned int oppw4_mixer_idx = ++oppw4_mixer_input_count;\n    if (oppw4_mixer_idx <= 60)\n    {\n        IMFMediaBuffer *oppw4_buf = NULL;\n        BYTE *oppw4_data = NULL;\n        DWORD oppw4_max = 0, oppw4_cur = 0;\n        HRESULT oppw4_cont_hr = IMFSample_ConvertToContiguousBuffer(sample, &oppw4_buf);\n        HRESULT oppw4_lock_hr = E_FAIL;\n        unsigned int oppw4_hash = 0, oppw4_nz = 0, oppw4_i, oppw4_inspect = 0;\n        GUID oppw4_subtype = {0};\n        if (mixer->inputs[0].media_type)\n            IMFMediaType_GetGUID(mixer->inputs[0].media_type, &MF_MT_SUBTYPE, &oppw4_subtype);\n        if (SUCCEEDED(oppw4_cont_hr))\n        {\n            oppw4_lock_hr = IMFMediaBuffer_Lock(oppw4_buf, &oppw4_data, &oppw4_max, &oppw4_cur);\n            if (SUCCEEDED(oppw4_lock_hr) && oppw4_data && oppw4_cur)\n            {\n                oppw4_inspect = oppw4_cur > 65536 ? 65536 : oppw4_cur;\n                for (oppw4_i = 0; oppw4_i < oppw4_inspect; oppw4_i += 67)\n                {\n                    oppw4_hash = (oppw4_hash * 33u) ^ oppw4_data[oppw4_i];\n                    if (oppw4_data[oppw4_i]) ++oppw4_nz;\n                }\n                IMFMediaBuffer_Unlock(oppw4_buf);\n            }\n            IMFMediaBuffer_Release(oppw4_buf);\n        }\n        ERR("OPPW4TRACE MIXER_INPUT #%u id=%lu flags=%#lx subtype=%s cont=%#lx lock=%#lx bytes=%lu inspect=%u hash=%08x nz=%u.\\n",\n                oppw4_mixer_idx, id, flags, debugstr_guid(&oppw4_subtype), oppw4_cont_hr, oppw4_lock_hr,\n                oppw4_cur, oppw4_inspect, oppw4_hash, oppw4_nz);\n    }\n'''
+          s = s[:n+len(needle)] + insert + s[n+len(needle):]
+
+          sig = 'static HRESULT WINAPI video_mixer_transform_ProcessOutput(IMFTransform *iface, DWORD flags, DWORD count,\n        MFT_OUTPUT_DATA_BUFFER *buffers, DWORD *status)\n{'
+          pos = s.find(sig)
+          if pos < 0:
+              raise SystemExit('mixer ProcessOutput signature not found')
+          needle = '    IDirect3DSurface9 *surface;\n'
+          n = s.find(needle, pos)
+          if n < 0:
+              raise SystemExit('mixer ProcessOutput declaration anchor not found')
+          insert = '''    static unsigned int oppw4_mixer_output_count;\n    unsigned int oppw4_output_idx = ++oppw4_mixer_output_count;\n    if (oppw4_output_idx <= 60)\n        ERR("OPPW4TRACE MIXER_OUTPUT #%u flags=%#lx count=%lu buffers=%p status=%p.\\n",\n                oppw4_output_idx, flags, count, buffers, status);\n'''
+          s = s[:n+len(needle)] + insert + s[n+len(needle):]
+
+          sig = 'static void video_mixer_render(struct video_mixer *mixer, IDirect3DSurface9 *rt)\n{'
+          pos = s.find(sig)
+          if pos < 0:
+              raise SystemExit('video_mixer_render signature not found')
+          needle = '    unsigned int i;\n'
+          n = s.find(needle, pos)
+          if n < 0:
+              raise SystemExit('video_mixer_render declaration anchor not found')
+          insert = '''    static unsigned int oppw4_blt_count;\n    unsigned int oppw4_blt_idx = ++oppw4_blt_count;\n    if (oppw4_blt_idx <= 60)\n    {\n        D3DSURFACE_DESC oppw4_rt_desc;\n        HRESULT oppw4_desc_hr = IDirect3DSurface9_GetDesc(rt, &oppw4_rt_desc);\n        ERR("OPPW4TRACE BLT_BEGIN #%u rt=%p desc=%#lx fmt=%#x %ux%u inputs=%u.\\n",\n                oppw4_blt_idx, rt, oppw4_desc_hr, SUCCEEDED(oppw4_desc_hr) ? oppw4_rt_desc.Format : 0,\n                SUCCEEDED(oppw4_desc_hr) ? oppw4_rt_desc.Width : 0,\n                SUCCEEDED(oppw4_desc_hr) ? oppw4_rt_desc.Height : 0, mixer->input_count);\n    }\n'''
+          s = s[:n+len(needle)] + insert + s[n+len(needle):]
+
+          old = '''        if (FAILED(hr = IDirectXVideoProcessor_VideoProcessBlt(mixer->processor, rt, &params, samples,\n                mixer->input_count, NULL)))\n        {\n            WARN("Failed to process samples, hr %#lx.\\n", hr);\n        }'''
+          new = '''        hr = IDirectXVideoProcessor_VideoProcessBlt(mixer->processor, rt, &params, samples,\n                mixer->input_count, NULL);\n        if (oppw4_blt_idx <= 60)\n            ERR("OPPW4TRACE BLT_END #%u hr=%#lx inputs=%u.\\n", oppw4_blt_idx, hr, mixer->input_count);\n        if (FAILED(hr))\n            WARN("Failed to process samples, hr %#lx.\\n", hr);'''
+          if old not in s:
+              raise SystemExit('VideoProcessBlt anchor not found')
+          s = s.replace(old, new, 1)
+          p.write_text(s)
+
+          # presenter.c: trace Media Foundation presenter notifications and final StretchRect/Present.
+          p = Path('dlls/evr/presenter.c')
+          s = p.read_text()
+          sig = 'static HRESULT WINAPI video_presenter_ProcessMessage(IMFVideoPresenter *iface, MFVP_MESSAGE_TYPE message, ULONG_PTR param)\n{'
+          pos = s.find(sig)
+          if pos < 0:
+              raise SystemExit('presenter ProcessMessage signature not found')
+          needle = '    HRESULT hr;\n'
+          n = s.find(needle, pos)
+          if n < 0:
+              raise SystemExit('presenter ProcessMessage declaration anchor not found')
+          insert = '''    static unsigned int oppw4_message_count;\n    unsigned int oppw4_message_idx = ++oppw4_message_count;\n    if (oppw4_message_idx <= 120)\n        ERR("OPPW4TRACE PRESENTER_MESSAGE #%u message=%u param=%Ix state=%u flags=%#x.\\n",\n                oppw4_message_idx, message, param, presenter->state, presenter->flags);\n'''
+          s = s[:n+len(needle)] + insert + s[n+len(needle):]
+
+          sig = 'static void video_presenter_sample_present(struct video_presenter *presenter, IMFSample *sample)\n{'
+          pos = s.find(sig)
+          if pos < 0:
+              raise SystemExit('sample_present signature not found')
+          needle = '    HRESULT hr;\n'
+          n = s.find(needle, pos)
+          if n < 0:
+              raise SystemExit('sample_present declaration anchor not found')
+          insert = '''    static unsigned int oppw4_present_count;\n    unsigned int oppw4_present_idx = ++oppw4_present_count;\n    if (oppw4_present_idx <= 60)\n        ERR("OPPW4TRACE PRESENT_BEGIN #%u sample=%p swapchain=%p.\\n", oppw4_present_idx, sample, presenter->swapchain);\n'''
+          s = s[:n+len(needle)] + insert + s[n+len(needle):]
+
+          old = '''    if (FAILED(hr = video_presenter_get_sample_surface(sample, &surface)))\n    {\n        WARN("Failed to get sample surface, hr %#lx.\\n", hr);\n        return;\n    }'''
+          new = '''    if (FAILED(hr = video_presenter_get_sample_surface(sample, &surface)))\n    {\n        if (oppw4_present_idx <= 60)\n            ERR("OPPW4TRACE PRESENT_SURFACE #%u get_surface=%#lx.\\n", oppw4_present_idx, hr);\n        WARN("Failed to get sample surface, hr %#lx.\\n", hr);\n        return;\n    }\n    else if (oppw4_present_idx <= 60)\n    {\n        D3DSURFACE_DESC oppw4_src_desc;\n        HRESULT oppw4_desc_hr = IDirect3DSurface9_GetDesc(surface, &oppw4_src_desc);\n        ERR("OPPW4TRACE PRESENT_SURFACE #%u get_surface=%#lx desc=%#lx fmt=%#x %ux%u.\\n",\n                oppw4_present_idx, hr, oppw4_desc_hr, SUCCEEDED(oppw4_desc_hr) ? oppw4_src_desc.Format : 0,\n                SUCCEEDED(oppw4_desc_hr) ? oppw4_src_desc.Width : 0,\n                SUCCEEDED(oppw4_desc_hr) ? oppw4_src_desc.Height : 0);\n    }'''
+          if old not in s:
+              raise SystemExit('present sample surface anchor not found')
+          s = s.replace(old, new, 1)
+
+          old = '''            IDirect3DSwapChain9_GetDevice(presenter->swapchain, &device);\n            IDirect3DDevice9_StretchRect(device, surface, NULL, backbuffer, NULL, D3DTEXF_POINT);\n\n            IDirect3DSwapChain9_Present(presenter->swapchain, NULL, NULL, NULL, NULL, 0);\n            presenter->frame_stats.presented++;'''
+          new = '''            HRESULT oppw4_stretch_hr, oppw4_swap_present_hr;\n            D3DSURFACE_DESC oppw4_back_desc;\n            HRESULT oppw4_back_desc_hr;\n            IDirect3DSwapChain9_GetDevice(presenter->swapchain, &device);\n            oppw4_back_desc_hr = IDirect3DSurface9_GetDesc(backbuffer, &oppw4_back_desc);\n            oppw4_stretch_hr = IDirect3DDevice9_StretchRect(device, surface, NULL, backbuffer, NULL, D3DTEXF_POINT);\n            oppw4_swap_present_hr = IDirect3DSwapChain9_Present(presenter->swapchain, NULL, NULL, NULL, NULL, 0);\n            if (oppw4_present_idx <= 60)\n                ERR("OPPW4TRACE PRESENT_END #%u back_desc=%#lx fmt=%#x %ux%u stretch=%#lx present=%#lx.\\n",\n                        oppw4_present_idx, oppw4_back_desc_hr, SUCCEEDED(oppw4_back_desc_hr) ? oppw4_back_desc.Format : 0,\n                        SUCCEEDED(oppw4_back_desc_hr) ? oppw4_back_desc.Width : 0,\n                        SUCCEEDED(oppw4_back_desc_hr) ? oppw4_back_desc.Height : 0,\n                        oppw4_stretch_hr, oppw4_swap_present_hr);\n            presenter->frame_stats.presented++;'''
+          if old not in s:
+              raise SystemExit('StretchRect/Present anchor not found')
+          s = s.replace(old, new, 1)
+          p.write_text(s)
+          PY
+
+          {
+            echo '=== main.c ==='
+            grep -n -A6 -B3 'OPPW4TRACE EVR_DLL_LOADED' dlls/evr/main.c
+            echo '=== mixer.c ==='
+            grep -n -A10 -B4 'OPPW4TRACE MIXER_INPUT' dlls/evr/mixer.c
+            grep -n -A8 -B4 'OPPW4TRACE BLT_END' dlls/evr/mixer.c
+            echo '=== presenter.c ==='
+            grep -n -A8 -B4 'OPPW4TRACE PRESENTER_MESSAGE' dlls/evr/presenter.c
+            grep -n -A12 -B5 'OPPW4TRACE PRESENT_END' dlls/evr/presenter.c
+          } | tee "$GITHUB_WORKSPACE/evr-trace-v4-patch.txt"
+
+      - name: Download Termux ARM64 sysroot
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/termuxfs/aarch64"
+          cd "$HOME/termuxfs/aarch64"
+          wget -q --show-progress https://github.com/GameNative/termux-on-gha/releases/download/build-20260218/termuxfs-aarch64.tar
+          tar -xf termuxfs-aarch64.tar
+
+      - name: Set up Android NDK r27d
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/Android/Sdk/ndk"
+          cd "$HOME/Android/Sdk/ndk"
+          wget -q --show-progress https://dl.google.com/android/repository/android-ndk-r27d-linux.zip
+          unzip -q android-ndk-r27d-linux.zip
+          mv android-ndk-r27d 27.3.13750724
+
+      - name: Set up LLVM-MinGW ARM64EC toolchain
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/toolchains"
+          cd "$HOME/toolchains"
+          wget -q --show-progress https://github.com/bylaws/llvm-mingw/releases/download/20250920/llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64.tar.xz
+          tar -xf llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64.tar.xz
+
+      - name: Autogen Proton 11
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/proton-src"
+          bash build-scripts/build-step0-autogen.sh
+          test -x ./configure
+
+      - name: Build wine-tools
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/proton-src"
+          bash build-scripts/build-step0.sh
+          test -d wine-tools
+
+      - name: Configure ARM64EC SDK35 / 16KB
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/proton-src"
+          bash build-scripts/build-step-arm64ec.sh --build-sysvshm
+          bash build-scripts/build-step-arm64ec.sh --enable-16kb-pages --configure
+
+      - name: Build and install Proton 11 ARM64EC
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/proton-src"
+          bash build-scripts/build-step-arm64ec.sh --enable-16kb-pages --build
+          bash build-scripts/build-step-arm64ec.sh --enable-16kb-pages --install
+
+      - name: Verify EVR payload exists
+        run: |
+          set -euxo pipefail
+          OUTPUT_DIR="$HOME/compiled-files-aarch64"
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          find "$OUTPUT_DIR" -type f -iname 'evr*' -print | sort | tee "$GITHUB_WORKSPACE/out/evr-files.txt"
+          test "$(find "$OUTPUT_DIR" -type f -iname 'evr*' | wc -l)" -gt 0
+          find "$OUTPUT_DIR" -type f -iname 'evr*' -exec sha256sum {} \; | tee "$GITHUB_WORKSPACE/out/evr-sha256.txt"
+
+      - name: Download Proton 11 ARM64EC prefix pack
+        run: |
+          set -euxo pipefail
+          wget -q --show-progress \
+            https://github.com/GameNative/bionic-prefix-files/raw/main/prefixPack-arm64ec-11.txz \
+            -O "$GITHUB_WORKSPACE/prefixPack.txz"
+
+      - name: Package Bannerlator EVR trace WCP
+        run: |
+          set -euxo pipefail
+          OUTPUT_DIR="$HOME/compiled-files-aarch64"
+          cd "$OUTPUT_DIR"
+          cp "$GITHUB_WORKSPACE/prefixPack.txz" .
+          cat > profile.json <<'EOF'
+          {
+            "type": "Proton",
+            "versionName": "11.0.3.5-arm64ec",
+            "versionCode": 2,
+            "description": "OPPW4 EVR TRACE v4: Proton 11 ARM64EC SDK35/16KB. Traces EVR DLL loading, MF mixer input bytes, DXVA2 VideoProcessBlt, presenter StretchRect and Present via OPPW4TRACE.",
+            "files": [],
+            "wine": {
+              "binPath": "bin",
+              "libPath": "lib",
+              "prefixPack": "prefixPack.txz"
+            }
+          }
+          EOF
+          tar -I 'zstd -T0 -15' -cf "$GITHUB_WORKSPACE/out/proton-11.0.3.5-arm64ec-opppw4-evr-trace-v4-sdk35.wcp" \
+            bin lib share prefixPack.txz profile.json
+          sha256sum "$GITHUB_WORKSPACE/out/proton-11.0.3.5-arm64ec-opppw4-evr-trace-v4-sdk35.wcp" \
+            | tee "$GITHUB_WORKSPACE/out/wcp-sha256.txt"
+          ls -lh "$GITHUB_WORKSPACE/out/proton-11.0.3.5-arm64ec-opppw4-evr-trace-v4-sdk35.wcp"
+
+      - name: Upload OPPW4 P11 EVR trace v4 Proton
+        uses: actions/upload-artifact@v4
+        with:
+          name: opppw4-p11-evr-trace-v4-arm64ec-sdk35
+          path: |
+            out/proton-11.0.3.5-arm64ec-opppw4-evr-trace-v4-sdk35.wcp
+            out/wcp-sha256.txt
+            out/evr-files.txt
+            out/evr-sha256.txt
+            p11-source-commit.txt
+            evr-trace-v4-patch.txt
+          if-no-files-found: error
+          retention-days: 14

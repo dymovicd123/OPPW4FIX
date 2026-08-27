@@ -1,0 +1,39 @@
+name: Build OPPW4 D3D9-D3D11 share verifier
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'tests/d3d9_d3d11_share_test.cpp'
+      - '.github/workflows/build-share-verifier.yml'
+
+jobs:
+  build-x64:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC x64
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build verifier
+        shell: cmd
+        run: |
+          if not exist out mkdir out
+          cl /nologo /std:c++17 /EHsc /O2 /W4 tests\d3d9_d3d11_share_test.cpp /Fe:out\opppw4-d3d9-d3d11-share-test-x64.exe /link d3d9.lib d3d11.lib dxgi.lib user32.lib
+
+      - name: Show PE metadata
+        shell: cmd
+        run: |
+          dumpbin /headers out\opppw4-d3d9-d3d11-share-test-x64.exe | findstr /i "machine subsystem"
+
+      - name: Upload verifier
+        uses: actions/upload-artifact@v4
+        with:
+          name: opppw4-d3d9-d3d11-share-verifier-x64
+          path: out/opppw4-d3d9-d3d11-share-test-x64.exe
+          if-no-files-found: error
+          retention-days: 14

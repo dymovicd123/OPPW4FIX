@@ -1,4 +1,5 @@
 #define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <d3d9.h>
@@ -51,9 +52,9 @@ static bool fill_rgb32(IDirect3DSurface9* surface) {
   for (UINT y = 0; y < H; ++y) {
     uint8_t* row = reinterpret_cast<uint8_t*>(lr.pBits) + y * lr.Pitch;
     for (UINT x = 0; x < W; ++x) {
-      row[x * 4 + 0] = 255; // B
-      row[x * 4 + 1] = 0;   // G
-      row[x * 4 + 2] = 255; // R
+      row[x * 4 + 0] = 255;
+      row[x * 4 + 1] = 0;
+      row[x * 4 + 2] = 255;
       row[x * 4 + 3] = 255;
     }
   }
@@ -70,10 +71,10 @@ static bool fill_yuy2(IDirect3DSurface9* surface) {
   for (UINT y = 0; y < H; ++y) {
     uint8_t* row = reinterpret_cast<uint8_t*>(lr.pBits) + y * lr.Pitch;
     for (UINT x = 0; x < W; x += 2) {
-      row[x * 2 + 0] = 200; // Y0
-      row[x * 2 + 1] = 128; // U
-      row[x * 2 + 2] = 200; // Y1
-      row[x * 2 + 3] = 128; // V
+      row[x * 2 + 0] = 200;
+      row[x * 2 + 1] = 128;
+      row[x * 2 + 2] = 200;
+      row[x * 2 + 3] = 128;
     }
   }
   surface->UnlockRect();

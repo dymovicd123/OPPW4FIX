@@ -38,6 +38,8 @@ jobs:
       - name: Seed DXVK source at targeted commit
         run: |
           git clone https://github.com/doitsujin/dxvk.git wcphub/src
+          git -C wcphub/src config user.name "OPPW4FIX CI"
+          git -C wcphub/src config user.email "opppw4fix@noreply.local"
           git -C wcphub/src fetch origin "$DXVK_TARGET_SHA"
           git -C wcphub/src tag -f "v${EXPERIMENT_VERSION}" "$DXVK_TARGET_SHA"
           echo "Target DXVK commit: $(git -C wcphub/src rev-parse v${EXPERIMENT_VERSION}^{commit})"

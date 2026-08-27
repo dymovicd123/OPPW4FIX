@@ -2,6 +2,8 @@ name: Build OPPW4 sharedgpures Proton
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
 
 permissions:
   contents: read
@@ -43,24 +45,16 @@ jobs:
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/proton-src"
-
-          curl -fL --retry 3 \
-            'https://github.com/avafloww/wine/commit/1c778c07af61870fb693d49c2b1b45ebff91384f.patch' \
-            -o /tmp/sharedgpures-312.patch
-          curl -fL --retry 3 \
-            'https://github.com/avafloww/wine/commit/63d1363133c17cbf63f75591cafc61484de54955.patch' \
-            -o /tmp/sharedgpures-313.patch
-
+          curl -fL --retry 3 'https://github.com/avafloww/wine/commit/1c778c07af61870fb693d49c2b1b45ebff91384f.patch' -o /tmp/sharedgpures-312.patch
+          curl -fL --retry 3 'https://github.com/avafloww/wine/commit/63d1363133c17cbf63f75591cafc61484de54955.patch' -o /tmp/sharedgpures-313.patch
           git apply --check /tmp/sharedgpures-312.patch
           git apply /tmp/sharedgpures-312.patch
           git apply --check /tmp/sharedgpures-313.patch
           git apply /tmp/sharedgpures-313.patch
-
           grep -q 'unix_resource_khandle' dlls/sharedgpures.sys/shared_resource.c
           grep -q 'NtDuplicateObject(NtCurrentProcess(), kernel_handle, client_process' dlls/sharedgpures.sys/shared_resource.c
           grep -q 'FsContext = (void \*)(UINT_PTR)-1' dlls/sharedgpures.sys/shared_resource.c
           grep -q 'FsContext == (UINT_PTR)-1' dlls/sharedgpures.sys/shared_resource.c
-
           git diff -- dlls/sharedgpures.sys/shared_resource.c | tee "$GITHUB_WORKSPACE/sharedgpures-applied.diff"
 
       - name: Download Termux ARM64 sysroot
@@ -68,8 +62,7 @@ jobs:
           set -euxo pipefail
           mkdir -p "$HOME/termuxfs/aarch64"
           cd "$HOME/termuxfs/aarch64"
-          wget -q --show-progress \
-            https://github.com/GameNative/termux-on-gha/releases/download/build-20260218/termuxfs-aarch64.tar
+          wget -q --show-progress https://github.com/GameNative/termux-on-gha/releases/download/build-20260218/termuxfs-aarch64.tar
           tar -xf termuxfs-aarch64.tar
 
       - name: Set up Android NDK r27d
@@ -86,8 +79,7 @@ jobs:
           set -euxo pipefail
           mkdir -p "$HOME/toolchains"
           cd "$HOME/toolchains"
-          wget -q --show-progress \
-            https://github.com/bylaws/llvm-mingw/releases/download/20250920/llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64.tar.xz
+          wget -q --show-progress https://github.com/bylaws/llvm-mingw/releases/download/20250920/llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64.tar.xz
           tar -xf llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64.tar.xz
 
       - name: Generate configure files
@@ -122,30 +114,23 @@ jobs:
         run: |
           set -euxo pipefail
           mkdir -p "$GITHUB_WORKSPACE/out"
-
-          DRIVER="$(find "$HOME/compiled-files-aarch64" "$GITHUB_WORKSPACE/proton-src" \
-            -type f -iname 'sharedgpures.sys' -print -quit)"
+          DRIVER="$(find "$HOME/compiled-files-aarch64" "$GITHUB_WORKSPACE/proton-src" -type f -iname 'sharedgpures.sys' -print -quit)"
           test -n "$DRIVER"
           cp "$DRIVER" "$GITHUB_WORKSPACE/out/sharedgpures-patched-arm64ec.sys"
-
           file "$DRIVER" | tee "$GITHUB_WORKSPACE/out/sharedgpures-file.txt"
           sha256sum "$DRIVER" | tee "$GITHUB_WORKSPACE/out/sharedgpures-sha256.txt"
-          strings -a "$DRIVER" | grep -Ei 'sharedgpu|SharedGpuResource|NtDuplicateObject|kernel handle|resource' \
-            | head -200 | tee "$GITHUB_WORKSPACE/out/sharedgpures-strings.txt" || true
+          strings -a "$DRIVER" | grep -Ei 'sharedgpu|SharedGpuResource|NtDuplicateObject|kernel handle|resource' | head -200 | tee "$GITHUB_WORKSPACE/out/sharedgpures-strings.txt" || true
 
       - name: Download Proton 10 ARM64EC prefix pack
         run: |
           set -euxo pipefail
-          wget -q --show-progress \
-            https://github.com/GameNative/bionic-prefix-files/raw/main/prefixPack-arm64ec.txz \
-            -O "$GITHUB_WORKSPACE/prefixPack.txz"
+          wget -q --show-progress https://github.com/GameNative/bionic-prefix-files/raw/main/prefixPack-arm64ec.txz -O "$GITHUB_WORKSPACE/prefixPack.txz"
 
       - name: Package Bannerlator test WCP
         run: |
           set -euxo pipefail
           OUTPUT_DIR="$HOME/compiled-files-aarch64"
           cd "$OUTPUT_DIR"
-
           cp "$GITHUB_WORKSPACE/prefixPack.txz" .
           cat > profile.json <<'EOF'
           {
@@ -161,13 +146,8 @@ jobs:
             }
           }
           EOF
-
-          tar -I 'zstd -T0 -15' -cf \
-            "$GITHUB_WORKSPACE/out/proton-10.0-4-arm64ec-opppw4-sharedgpures-sdk35.wcp" \
-            bin lib share prefixPack.txz profile.json
-
-          sha256sum "$GITHUB_WORKSPACE/out/proton-10.0-4-arm64ec-opppw4-sharedgpures-sdk35.wcp" \
-            | tee "$GITHUB_WORKSPACE/out/wcp-sha256.txt"
+          tar -I 'zstd -T0 -15' -cf "$GITHUB_WORKSPACE/out/proton-10.0-4-arm64ec-opppw4-sharedgpures-sdk35.wcp" bin lib share prefixPack.txz profile.json
+          sha256sum "$GITHUB_WORKSPACE/out/proton-10.0-4-arm64ec-opppw4-sharedgpures-sdk35.wcp" | tee "$GITHUB_WORKSPACE/out/wcp-sha256.txt"
           ls -lh "$GITHUB_WORKSPACE/out/proton-10.0-4-arm64ec-opppw4-sharedgpures-sdk35.wcp"
 
       - name: Upload patched Proton WCP

@@ -76,27 +76,26 @@ Device result with the same Proton 11 container:
 
 Conclusion: rejecting D3D11 runtime descriptors during D3D9 reverse import is **not** the remaining OPPW4 black-video cause in this configuration.
 
-### Stronger EVR / DXVA2 YUV hypothesis
+### EVR / D3D9 YUV StretchRect verifier
 
-Wine's EVR path is D3D9 based. Decoded frames can enter EVR as RGB32, YUY2 or NV12. The EVR mixer uses `IDirectXVideoProcessor::VideoProcessBlt`, and Wine's DXVA2 implementation performs the actual conversion/copy with `IDirect3DDevice9::StretchRect` from the video surface to an RGB render target. The presenter then performs another D3D9 `StretchRect` to its swapchain backbuffer and presents it.
+Focused verifier: `tests/d3d9_evr_yuv_stretch_test.cpp`.
 
-Important behavior: the DXVA2 `VideoProcessBlt` implementation logs an individual `StretchRect` failure but still returns `S_OK`; the EVR presenter also does not use the return value of its final `StretchRect`. Therefore a failed YUY2/NV12 -> RGB D3D9 conversion can plausibly produce exactly the observed symptom: the media timeline and audio continue normally while the video area remains black.
+Device result in the same Proton 11 + DXVK 3.0.99 container: **PASS_ALL**.
 
-DXVK does contain D3D9 YUY2 and NV12 mappings/conversion helpers, so the next question is whether that path actually works with this Android/Turnip ARM64EC stack.
+Observed readback:
 
-A focused standalone verifier was added:
+- RGB32 baseline: PASS, BGRA `255,0,255,255`.
+- YUY2 -> X8R8G8B8: PASS, BGRA `185,185,185,255`.
+- NV12 -> X8R8G8B8: PASS, BGRA `214,214,214,255`.
+- Every `CreateOffscreenPlainSurface`, `LockRect`, `StretchRect`, `GetRenderTargetData` and readback call returned `S_OK`.
 
-- source: `tests/d3d9_evr_yuv_stretch_test.cpp`
-- workflow: `.github/workflows/build-evr-yuv-verifier.yml`
+Conclusion: generic D3D9 YUY2/NV12 surface creation, CPU fill, YUV -> RGB `StretchRect`, RGB backbuffer transfer and readback all work on this ARM64EC + DXVK + Turnip stack. The black OPPW4 FMV is therefore **not** caused by generic DXVK D3D9 YUV conversion.
 
-It tests three D3D9 `StretchRect` cases to an X8R8G8B8 backbuffer with pixel readback:
+This pushes the fault higher into the real Wine EVR path. The remaining candidates are now much narrower:
 
-1. RGB32 baseline
-2. YUY2 -> RGB
-3. NV12 -> RGB
+1. Wine `IMFVideoSampleAllocator` / D3D9 video sample surfaces.
+2. Wine DXVA2 `IDirectXVideoProcessor::VideoProcessBlt` and its EVR-specific source/output surfaces or rectangles.
+3. Copying the decoded `IMediaSample` into the allocated D3D9 surface (`evr_copy_sample_buffer`) including actual media subtype/stride.
+4. EVR mixer -> presenter handoff / final presentation behavior.
 
-Interpretation:
-
-- RGB32 passes, YUY2/NV12 fail: strong evidence that the missing FMV image is the EVR/DXVA2 YUV conversion path.
-- all three pass: move higher into the EVR mixer/output-surface/presenter chain instead of generic YUV conversion.
-- RGB32 baseline fails: broader D3D9 offscreen -> backbuffer path problem.
+Next diagnostic should exercise the Wine DXVA2 device-manager/video-processor path and, ideally, the MF video sample allocator rather than another raw D3D9 `StretchRect` test.

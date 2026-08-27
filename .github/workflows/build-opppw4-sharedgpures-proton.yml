@@ -135,9 +135,9 @@ jobs:
           cat > profile.json <<'EOF'
           {
             "type": "Proton",
-            "versionName": "10.0-4-arm64ec-opppw4-sharedgpures",
-            "versionCode": 91,
-            "description": "EXPERIMENTAL OPPW4 build: Proton 10.0-4 ARM64EC SDK35 with Valve sharedgpures PR 312 + 313 fixes. Keep separate from normal containers.",
+            "versionName": "10.0.4.313-arm64ec",
+            "versionCode": 9,
+            "description": "EXPERIMENTAL OPPW4 build: Proton 10.0-4 ARM64EC SDK35 with Valve sharedgpures PR 312 + 313 fixes. Boot-safe custom identifier for Bannerlator; keep separate from normal containers.",
             "files": [],
             "wine": {
               "binPath": "bin",
@@ -146,6 +146,17 @@ jobs:
             }
           }
           EOF
+          python3 - <<'PY'
+          import json, re
+          with open('profile.json', encoding='utf-8') as f:
+              p = json.load(f)
+          assert 0 <= p['versionCode'] <= 9, 'Bannerlator WineInfo strips exactly -<one digit> from content identifiers'
+          entry = f"{p['type']}-{p['versionName']}-{p['versionCode']}"
+          parsed = entry[:-2].lower()
+          boot_re = re.compile(r'^(wine|proton)\-([0-9\.]+)\-?([0-9\.]+)?\-(x86|x86_64|arm64ec)$')
+          assert boot_re.fullmatch(parsed), f'Bannerlator WineInfo boot regex rejects {parsed!r}'
+          print('Bannerlator boot identifier OK:', parsed)
+          PY
           tar -I 'zstd -T0 -15' -cf "$GITHUB_WORKSPACE/out/proton-10.0-4-arm64ec-opppw4-sharedgpures-sdk35.wcp" bin lib share prefixPack.txz profile.json
           sha256sum "$GITHUB_WORKSPACE/out/proton-10.0-4-arm64ec-opppw4-sharedgpures-sdk35.wcp" | tee "$GITHUB_WORKSPACE/out/wcp-sha256.txt"
           ls -lh "$GITHUB_WORKSPACE/out/proton-10.0-4-arm64ec-opppw4-sharedgpures-sdk35.wcp"

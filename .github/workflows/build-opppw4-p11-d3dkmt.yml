@@ -1,0 +1,191 @@
+name: Build OPPW4 Proton 11 D3DKMT diagnostic
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-opppw4-p11-d3dkmt.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-arm64ec-sdk35:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h
+
+      - name: Install host build dependencies
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential git wget curl unzip xz-utils zstd file ccache \
+            flex bison gettext autoconf automake libtool pkg-config \
+            mingw-w64 gcc-multilib g++-multilib \
+            libfreetype6-dev libfreetype6-dev:i386 \
+            libpng-dev libpng-dev:i386 zlib1g-dev zlib1g-dev:i386
+
+      - name: Clone GE Proton 11 bionic source
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 --branch ge-proton11-bionic --recurse-submodules --shallow-submodules \
+            https://github.com/The412Banner/proton-wine.git "$GITHUB_WORKSPACE/proton-src"
+          cd "$GITHUB_WORKSPACE/proton-src"
+          git submodule status --recursive
+          git rev-parse HEAD | tee "$GITHUB_WORKSPACE/p11-source-commit.txt"
+
+      - name: Verify P11 D3DKMT resource sharing and winedmo source
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/proton-src"
+          test -f dlls/win32u/d3dkmt.c
+          test -f dlls/winedmo/Makefile.in
+          test -f dlls/winedmo/main.c
+          grep -q 'NTSTATUS WINAPI NtGdiDdDDIQueryResourceInfo' dlls/win32u/d3dkmt.c
+          grep -q 'NTSTATUS WINAPI NtGdiDdDDIOpenResource' dlls/win32u/d3dkmt.c
+          grep -q 'd3dkmt_object_query' dlls/win32u/d3dkmt.c
+          grep -q 'd3dkmt_object_open' dlls/win32u/d3dkmt.c
+          grep -q '^MODULE.*=.*winedmo.dll' dlls/winedmo/Makefile.in
+          grep -q '^UNIXLIB.*=.*winedmo.so' dlls/winedmo/Makefile.in
+          {
+            echo '=== SOURCE COMMIT ==='
+            git rev-parse HEAD
+            echo '=== QueryResourceInfo markers ==='
+            grep -n -A35 -B5 'NtGdiDdDDIQueryResourceInfo' dlls/win32u/d3dkmt.c | head -120
+            echo '=== OpenResource markers ==='
+            grep -n -A45 -B5 'NtGdiDdDDIOpenResource' dlls/win32u/d3dkmt.c | head -160
+            echo '=== WINEDMO MAKEFILE ==='
+            cat dlls/winedmo/Makefile.in
+          } | tee "$GITHUB_WORKSPACE/p11-source-diagnostics.txt"
+
+      - name: Download Termux ARM64 sysroot
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/termuxfs/aarch64"
+          cd "$HOME/termuxfs/aarch64"
+          wget -q --show-progress https://github.com/GameNative/termux-on-gha/releases/download/build-20260218/termuxfs-aarch64.tar
+          tar -xf termuxfs-aarch64.tar
+
+      - name: Set up Android NDK r27d
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/Android/Sdk/ndk"
+          cd "$HOME/Android/Sdk/ndk"
+          wget -q --show-progress https://dl.google.com/android/repository/android-ndk-r27d-linux.zip
+          unzip -q android-ndk-r27d-linux.zip
+          mv android-ndk-r27d 27.3.13750724
+
+      - name: Set up LLVM-MinGW ARM64EC toolchain
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/toolchains"
+          cd "$HOME/toolchains"
+          wget -q --show-progress https://github.com/bylaws/llvm-mingw/releases/download/20250920/llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64.tar.xz
+          tar -xf llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64.tar.xz
+
+      - name: Autogen Proton 11
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/proton-src"
+          bash build-scripts/build-step0-autogen.sh
+          test -x ./configure
+
+      - name: Build wine-tools
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/proton-src"
+          bash build-scripts/build-step0.sh
+          test -d wine-tools
+
+      - name: Configure ARM64EC SDK35 / 16KB
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/proton-src"
+          bash build-scripts/build-step-arm64ec.sh --build-sysvshm
+          bash build-scripts/build-step-arm64ec.sh --enable-16kb-pages --configure
+
+      - name: Build and install Proton 11 ARM64EC
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/proton-src"
+          bash build-scripts/build-step-arm64ec.sh --enable-16kb-pages --build
+          bash build-scripts/build-step-arm64ec.sh --enable-16kb-pages --install
+
+      - name: Verify installed D3DKMT and winedmo payload
+        run: |
+          set -euxo pipefail
+          OUTPUT_DIR="$HOME/compiled-files-aarch64"
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          find "$OUTPUT_DIR" -type f \( -iname 'winedmo*' -o -iname '*win32u*' \) -print | sort | tee "$GITHUB_WORKSPACE/out/p11-installed-media-d3dkmt-files.txt"
+          WINEDMO_COUNT="$(find "$OUTPUT_DIR" -type f -iname 'winedmo*' | wc -l)"
+          WIN32U_COUNT="$(find "$OUTPUT_DIR" -type f -iname '*win32u*' | wc -l)"
+          test "$WINEDMO_COUNT" -gt 0
+          test "$WIN32U_COUNT" -gt 0
+          {
+            echo "winedmo_count=$WINEDMO_COUNT"
+            echo "win32u_count=$WIN32U_COUNT"
+            echo '=== winedmo hashes ==='
+            find "$OUTPUT_DIR" -type f -iname 'winedmo*' -exec sha256sum {} \;
+            echo '=== win32u hashes ==='
+            find "$OUTPUT_DIR" -type f -iname '*win32u*' -exec sha256sum {} \;
+            echo '=== relevant exported/string markers ==='
+            find "$OUTPUT_DIR" -type f -iname '*win32u*' -exec sh -c 'echo --- "$1"; strings -a "$1" | grep -E "NtGdiDdDDI(QueryResourceInfo|OpenResource)" | head -40 || true' _ {} \;
+          } | tee "$GITHUB_WORKSPACE/out/p11-binary-diagnostics.txt"
+
+      - name: Download Proton 11 ARM64EC prefix pack
+        run: |
+          set -euxo pipefail
+          wget -q --show-progress \
+            https://github.com/GameNative/bionic-prefix-files/raw/main/prefixPack-arm64ec-11.txz \
+            -O "$GITHUB_WORKSPACE/prefixPack.txz"
+
+      - name: Package Bannerlator diagnostic WCP
+        run: |
+          set -euxo pipefail
+          OUTPUT_DIR="$HOME/compiled-files-aarch64"
+          cd "$OUTPUT_DIR"
+          cp "$GITHUB_WORKSPACE/prefixPack.txz" .
+          cat > profile.json <<'EOF'
+          {
+            "type": "Proton",
+            "versionName": "11.0-3-arm64ec",
+            "versionCode": 8,
+            "description": "OPPW4 DIAGNOSTIC: GE Proton 11.0-3 ARM64EC SDK35/16KB with P11 D3DKMT QueryResourceInfo/OpenResource path and winedmo. Separate A/B test build.",
+            "files": [],
+            "wine": {
+              "binPath": "bin",
+              "libPath": "lib",
+              "prefixPack": "prefixPack.txz"
+            }
+          }
+          EOF
+          tar -I 'zstd -T0 -15' -cf "$GITHUB_WORKSPACE/out/proton-11.0-3-arm64ec-opppw4-d3dkmt-sdk35.wcp" \
+            bin lib share prefixPack.txz profile.json
+          sha256sum "$GITHUB_WORKSPACE/out/proton-11.0-3-arm64ec-opppw4-d3dkmt-sdk35.wcp" \
+            | tee "$GITHUB_WORKSPACE/out/wcp-sha256.txt"
+          tar -I zstd -tf "$GITHUB_WORKSPACE/out/proton-11.0-3-arm64ec-opppw4-d3dkmt-sdk35.wcp" \
+            | grep -E '(^profile.json$|winedmo|win32u)' \
+            | head -200 | tee "$GITHUB_WORKSPACE/out/wcp-relevant-files.txt"
+          ls -lh "$GITHUB_WORKSPACE/out/proton-11.0-3-arm64ec-opppw4-d3dkmt-sdk35.wcp"
+
+      - name: Upload OPPW4 P11 diagnostic Proton
+        uses: actions/upload-artifact@v4
+        with:
+          name: opppw4-p11-d3dkmt-arm64ec-sdk35
+          path: |
+            out/proton-11.0-3-arm64ec-opppw4-d3dkmt-sdk35.wcp
+            out/wcp-sha256.txt
+            out/wcp-relevant-files.txt
+            out/p11-installed-media-d3dkmt-files.txt
+            out/p11-binary-diagnostics.txt
+            p11-source-commit.txt
+            p11-source-diagnostics.txt
+          if-no-files-found: error
+          retention-days: 14

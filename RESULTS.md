@@ -62,29 +62,41 @@ Observed details:
 
 This closes the hypothesis that generic D3D9 -> D3D11 shared memory is fundamentally broken.
 
-### Important directionality finding after PASS
+### Targeted DXVK imported-D3D11 validation build
 
-The verifier tested **D3D9 creates the resource -> D3D11 opens it**.
+Experimental ARM64EC DXVK `3.0.99` was built from upstream commit `d647fdf3c554ba917f88e01374602e06f664491d` (`[d3d9] Pass validation for imported D3D11 textures.`).
 
-The Media Foundation / D3D9 device-manager path used by OPPW4 may exercise the reverse import direction: **D3D11-created resource -> D3D9 imports/validates/writes it -> D3D11 consumes it**.
+Device result with the same Proton 11 container:
 
-Very recent upstream DXVK commit `d647fdf3c554ba917f88e01374602e06f664491d` (2026-08-26), titled:
+- HUD confirms `DXVK v3.0.99-arm64ec` is actually loaded.
+- Cutscene still starts.
+- Audio and subtitles still work.
+- Video remains completely black.
+- No meaningful visual change versus DXVK 3.0.2.
 
-`[d3d9] Pass validation for imported D3D11 textures.`
+Conclusion: rejecting D3D11 runtime descriptors during D3D9 reverse import is **not** the remaining OPPW4 black-video cause in this configuration.
 
-changes `D3D9DeviceEx::ValidateSharedTexture` specifically so D3D9 accepts D3D11 runtime descriptors (`version == 4`) instead of rejecting them as invalid D3D9 descriptors.
+### Stronger EVR / DXVA2 YUV hypothesis
 
-That commit is newer than DXVK 3.0.2 and is therefore absent from the tested stable WCP.
+Wine's EVR path is D3D9 based. Decoded frames can enter EVR as RGB32, YUY2 or NV12. The EVR mixer uses `IDirectXVideoProcessor::VideoProcessBlt`, and Wine's DXVA2 implementation performs the actual conversion/copy with `IDirect3DDevice9::StretchRect` from the video surface to an RGB render target. The presenter then performs another D3D9 `StretchRect` to its swapchain backbuffer and presents it.
 
-A targeted ARM64EC DXVK build workflow has been added:
+Important behavior: the DXVA2 `VideoProcessBlt` implementation logs an individual `StretchRect` failure but still returns `S_OK`; the EVR presenter also does not use the return value of its final `StretchRect`. Therefore a failed YUY2/NV12 -> RGB D3D9 conversion can plausibly produce exactly the observed symptom: the media timeline and audio continue normally while the video area remains black.
 
-`.github/workflows/build-dxvk-opppw4-imported-d3d11.yml`
+DXVK does contain D3D9 YUY2 and NV12 mappings/conversion helpers, so the next question is whether that path actually works with this Android/Turnip ARM64EC stack.
 
-It pins exactly commit `d647fdf3...` and packages it as an experimental `dxvk-arm64ec-3.0.99.wcp` for a one-variable A/B test against DXVK 3.0.2.
+A focused standalone verifier was added:
 
-Next device test after the build succeeds:
+- source: `tests/d3d9_evr_yuv_stretch_test.cpp`
+- workflow: `.github/workflows/build-evr-yuv-verifier.yml`
 
-1. Keep the same diagnostic Proton 11 container.
-2. Keep Wrapper, Turnip, VKD3D, resolution and game files unchanged.
-3. Change only DXVK 3.0.2 -> targeted `3.0.99` build.
-4. Re-test the same Gallery cutscene.
+It tests three D3D9 `StretchRect` cases to an X8R8G8B8 backbuffer with pixel readback:
+
+1. RGB32 baseline
+2. YUY2 -> RGB
+3. NV12 -> RGB
+
+Interpretation:
+
+- RGB32 passes, YUY2/NV12 fail: strong evidence that the missing FMV image is the EVR/DXVA2 YUV conversion path.
+- all three pass: move higher into the EVR mixer/output-surface/presenter chain instead of generic YUV conversion.
+- RGB32 baseline fails: broader D3D9 offscreen -> backbuffer path problem.

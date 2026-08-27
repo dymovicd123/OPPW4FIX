@@ -6,6 +6,7 @@ on:
     branches: [main]
     paths:
       - 'tests/dxva2_evr_processor_test.cpp'
+      - 'tests/dxva2_local_guids.cpp'
       - '.github/workflows/build-dxva2-evr-verifier.yml'
 
 permissions:
@@ -29,7 +30,7 @@ jobs:
         shell: cmd
         run: |
           if not exist out mkdir out
-          cl /nologo /std:c++17 /EHsc /O2 /W4 tests\dxva2_evr_processor_test.cpp /Fe:out\opppw4-dxva2-evr-processor-test-x64.exe /link d3d9.lib dxva2.lib dxguid.lib user32.lib ole32.lib
+          cl /nologo /std:c++17 /EHsc /O2 /W4 tests\dxva2_evr_processor_test.cpp tests\dxva2_local_guids.cpp /Fe:out\opppw4-dxva2-evr-processor-test-x64.exe /link d3d9.lib dxva2.lib user32.lib ole32.lib
 
       - name: Upload verifier
         uses: actions/upload-artifact@v4

@@ -56,20 +56,20 @@ jobs:
           test -f "wcphub/out/dxvk-arm64ec-${EXPERIMENT_VERSION}.wcp"
           sha256sum "wcphub/out/dxvk-arm64ec-${EXPERIMENT_VERSION}.wcp" | tee dxvk-wcp.sha256
           printf '%s\n' "$DXVK_TARGET_SHA" > dxvk-target-sha.txt
-          cat > TEST-INSTRUCTIONS.txt <<'EOF'
-OPPW4 targeted DXVK test
-
-Purpose:
-Test DXVK commit d647fdf3c554ba917f88e01374602e06f664491d:
-[d3d9] Pass validation for imported D3D11 textures.
-
-This is specifically relevant to the reverse sharing direction used by media pipelines where a D3D11-created texture is imported into D3D9 for decoding/writing.
-
-Use with the same diagnostic Proton 11 container that already ran OPPW4 with DXVK 3.0.2.
-Change only DXVK to this experimental WCP.
-Keep Wrapper, Turnip, VKD3D, resolution and game files unchanged.
-Re-test the same Gallery cutscene.
-EOF
+          printf '%s\n' \
+            'OPPW4 targeted DXVK test' \
+            '' \
+            'Purpose:' \
+            'Test DXVK commit d647fdf3c554ba917f88e01374602e06f664491d:' \
+            '[d3d9] Pass validation for imported D3D11 textures.' \
+            '' \
+            'This targets the reverse sharing direction where a D3D11-created texture is imported into D3D9.' \
+            '' \
+            'Use the same diagnostic Proton 11 container that ran OPPW4 with DXVK 3.0.2.' \
+            'Change only DXVK to this experimental WCP.' \
+            'Keep Wrapper, Turnip, VKD3D, resolution and game files unchanged.' \
+            'Re-test the same Gallery cutscene.' \
+            > TEST-INSTRUCTIONS.txt
 
       - name: Upload targeted DXVK artifact
         uses: actions/upload-artifact@v4

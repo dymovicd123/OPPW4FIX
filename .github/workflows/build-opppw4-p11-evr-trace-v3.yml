@@ -1,0 +1,220 @@
+name: Build OPPW4 Proton 11 EVR real-path trace v3
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-opppw4-p11-evr-trace-v3.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-arm64ec-sdk35:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h
+
+      - name: Install host build dependencies
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential git wget curl unzip xz-utils zstd file ccache \
+            flex bison gettext autoconf automake libtool pkg-config \
+            mingw-w64 gcc-multilib g++-multilib \
+            libfreetype6-dev libfreetype6-dev:i386 \
+            libpng-dev libpng-dev:i386 zlib1g-dev zlib1g-dev:i386
+
+      - name: Clone GE Proton 11 bionic source
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 --branch ge-proton11-bionic --recurse-submodules --shallow-submodules \
+            https://github.com/The412Banner/proton-wine.git "$GITHUB_WORKSPACE/proton-src"
+          cd "$GITHUB_WORKSPACE/proton-src"
+          git rev-parse HEAD | tee "$GITHUB_WORKSPACE/p11-source-commit.txt"
+
+      - name: Instrument real EVR render path
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/proton-src"
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('dlls/evr/evr.c')
+          s = p.read_text()
+
+          # 1) Add a per-render counter.
+          anchor = '    IMFSample *sample;\n\n    if (!filter->media_type)'
+          repl = '''    IMFSample *sample;\n    static unsigned int oppw4_render_count;\n    unsigned int oppw4_trace_idx;\n\n    if (!filter->media_type)'''
+          if anchor not in s:
+              raise SystemExit('evr_render declaration anchor not found')
+          s = s.replace(anchor, repl, 1)
+
+          # 2) Trace the actual DirectShow sample handed to Wine EVR.
+          anchor = '    IMFMediaType_GetGUID(filter->media_type, &MF_MT_SUBTYPE, &subtype);\n\n    if (IsEqualGUID(&subtype, &MFVideoFormat_ARGB32)'
+          repl = '''    IMFMediaType_GetGUID(filter->media_type, &MF_MT_SUBTYPE, &subtype);\n    oppw4_trace_idx = ++oppw4_render_count;\n    if (oppw4_trace_idx <= 40)\n    {\n        BYTE *oppw4_src = NULL;\n        LONG oppw4_len = IMediaSample_GetActualDataLength(input_sample);\n        LONG oppw4_size = IMediaSample_GetSize(input_sample);\n        HRESULT oppw4_ptr_hr = IMediaSample_GetPointer(input_sample, &oppw4_src);\n        unsigned int oppw4_sum = 0, oppw4_nonzero = 0, oppw4_i, oppw4_inspect = 0;\n\n        if (SUCCEEDED(oppw4_ptr_hr) && oppw4_src && oppw4_len > 0)\n        {\n            oppw4_inspect = oppw4_len > 16384 ? 16384 : oppw4_len;\n            for (oppw4_i = 0; oppw4_i < oppw4_inspect; oppw4_i += 17)\n            {\n                oppw4_sum = (oppw4_sum * 33u) ^ oppw4_src[oppw4_i];\n                if (oppw4_src[oppw4_i]) ++oppw4_nonzero;\n            }\n        }\n        ERR("OPPW4TRACE RENDER #%u subtype=%s actual=%ld size=%ld ptr_hr=%#lx inspect=%u sum=%08x nonzero=%u first=%02x,%02x,%02x,%02x.\\n",\n                oppw4_trace_idx, debugstr_guid(&subtype), oppw4_len, oppw4_size, oppw4_ptr_hr,\n                oppw4_inspect, oppw4_sum, oppw4_nonzero,\n                oppw4_src && oppw4_len > 0 ? oppw4_src[0] : 0,\n                oppw4_src && oppw4_len > 1 ? oppw4_src[1] : 0,\n                oppw4_src && oppw4_len > 2 ? oppw4_src[2] : 0,\n                oppw4_src && oppw4_len > 3 ? oppw4_src[3] : 0);\n    }\n\n    if (IsEqualGUID(&subtype, &MFVideoFormat_ARGB32)'''
+          if anchor not in s:
+              raise SystemExit('evr subtype trace anchor not found')
+          s = s.replace(anchor, repl, 1)
+
+          # 3) Trace bytes after Wine copies the sample into the allocator D3D9 surface.
+          anchor = '                IDirect3DSurface9_UnlockRect(surface);'
+          repl = '''                if (oppw4_trace_idx <= 40)\n                {\n                    BYTE *oppw4_dst = locked_rect.pBits;\n                    unsigned int oppw4_dst_sum = 0, oppw4_dst_nonzero = 0, oppw4_i;\n                    unsigned int oppw4_dst_bytes = locked_rect.Pitch > 0 ? locked_rect.Pitch : 0;\n                    if (oppw4_dst_bytes > 16384) oppw4_dst_bytes = 16384;\n                    for (oppw4_i = 0; oppw4_i < oppw4_dst_bytes; oppw4_i += 17)\n                    {\n                        oppw4_dst_sum = (oppw4_dst_sum * 33u) ^ oppw4_dst[oppw4_i];\n                        if (oppw4_dst[oppw4_i]) ++oppw4_dst_nonzero;\n                    }\n                    ERR("OPPW4TRACE COPY #%u subtype=%s src_stride=%ld dst_pitch=%d dst_inspect=%u dst_sum=%08x dst_nonzero=%u.\\n",\n                            oppw4_trace_idx, debugstr_guid(subtype), src_stride, locked_rect.Pitch,\n                            oppw4_dst_bytes, oppw4_dst_sum, oppw4_dst_nonzero);\n                }\n                IDirect3DSurface9_UnlockRect(surface);'''
+          # oppw4_trace_idx is not in evr_copy_sample_buffer scope; give copy its own counter instead.
+          repl = repl.replace('if (oppw4_trace_idx <= 40)', 'if (++oppw4_copy_count <= 40)')\
+                     .replace('oppw4_trace_idx, debugstr_guid(subtype)', 'oppw4_copy_count, debugstr_guid(subtype)')
+          copy_decl_anchor = '    BYTE *dst_uv;\n\n    if (FAILED(hr = IMFMediaType_GetUINT32'
+          copy_decl_repl = '    BYTE *dst_uv;\n    static unsigned int oppw4_copy_count;\n\n    if (FAILED(hr = IMFMediaType_GetUINT32'
+          if copy_decl_anchor not in s:
+              raise SystemExit('copy declaration anchor not found')
+          s = s.replace(copy_decl_anchor, copy_decl_repl, 1)
+          if anchor not in s:
+              raise SystemExit('copy unlock anchor not found')
+          s = s.replace(anchor, repl, 1)
+
+          # 4) Log mixer/presenter call results without changing the return semantics of evr_render().
+          anchor = '''            if (SUCCEEDED(IMFTransform_ProcessInput(filter->mixer, 0, sample, 0)))\n                IMFVideoPresenter_ProcessMessage(filter->presenter, MFVP_MESSAGE_PROCESSINPUTNOTIFY, 0);'''
+          repl = '''            {\n                HRESULT oppw4_input_hr = IMFTransform_ProcessInput(filter->mixer, 0, sample, 0);\n                HRESULT oppw4_present_hr = E_NOTIMPL;\n                if (SUCCEEDED(oppw4_input_hr))\n                    oppw4_present_hr = IMFVideoPresenter_ProcessMessage(filter->presenter, MFVP_MESSAGE_PROCESSINPUTNOTIFY, 0);\n                if (oppw4_trace_idx <= 40)\n                    ERR("OPPW4TRACE PIPE #%u copy_hr=%#lx mixer_input_hr=%#lx presenter_notify_hr=%#lx.\\n",\n                            oppw4_trace_idx, hr, oppw4_input_hr, oppw4_present_hr);\n            }'''
+          if anchor not in s:
+              raise SystemExit('mixer/presenter anchor not found')
+          s = s.replace(anchor, repl, 1)
+
+          p.write_text(s)
+
+          # 5) Add entry traces to the actual MFVideoMixer9 ProcessInput/ProcessOutput implementation.
+          p = Path('dlls/evr/mixer.c')
+          s = p.read_text()
+          anchor = '''static HRESULT WINAPI video_mixer_transform_ProcessInput(IMFTransform *iface, DWORD id, IMFSample *sample, DWORD flags)\n{'''
+          repl = '''static HRESULT WINAPI video_mixer_transform_ProcessInput(IMFTransform *iface, DWORD id, IMFSample *sample, DWORD flags)\n{\n    static unsigned int oppw4_mixer_input_count;\n    if (++oppw4_mixer_input_count <= 40)\n        ERR("OPPW4TRACE MIXER_INPUT #%u id=%lu sample=%p flags=%#lx.\\n", oppw4_mixer_input_count, id, sample, flags);'''
+          if anchor not in s:
+              raise SystemExit('mixer ProcessInput anchor not found')
+          s = s.replace(anchor, repl, 1)
+
+          anchor = '''static HRESULT WINAPI video_mixer_transform_ProcessOutput(IMFTransform *iface, DWORD flags, DWORD count,\n        MFT_OUTPUT_DATA_BUFFER *samples, DWORD *status)\n{'''
+          repl = '''static HRESULT WINAPI video_mixer_transform_ProcessOutput(IMFTransform *iface, DWORD flags, DWORD count,\n        MFT_OUTPUT_DATA_BUFFER *samples, DWORD *status)\n{\n    static unsigned int oppw4_mixer_output_count;\n    if (++oppw4_mixer_output_count <= 40)\n        ERR("OPPW4TRACE MIXER_OUTPUT #%u flags=%#lx count=%lu samples=%p status=%p.\\n",\n                oppw4_mixer_output_count, flags, count, samples, status);'''
+          if anchor not in s:
+              raise SystemExit('mixer ProcessOutput anchor not found')
+          s = s.replace(anchor, repl, 1)
+          p.write_text(s)
+          PY
+
+          grep -n -A12 -B4 'OPPW4TRACE RENDER' dlls/evr/evr.c | tee "$GITHUB_WORKSPACE/evr-trace-patch.txt"
+          grep -n -A8 -B4 'OPPW4TRACE MIXER_' dlls/evr/mixer.c | tee -a "$GITHUB_WORKSPACE/evr-trace-patch.txt"
+          grep -q 'OPPW4TRACE PIPE' dlls/evr/evr.c
+          grep -q 'OPPW4TRACE MIXER_OUTPUT' dlls/evr/mixer.c
+
+      - name: Download Termux ARM64 sysroot
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/termuxfs/aarch64"
+          cd "$HOME/termuxfs/aarch64"
+          wget -q --show-progress https://github.com/GameNative/termux-on-gha/releases/download/build-20260218/termuxfs-aarch64.tar
+          tar -xf termuxfs-aarch64.tar
+
+      - name: Set up Android NDK r27d
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/Android/Sdk/ndk"
+          cd "$HOME/Android/Sdk/ndk"
+          wget -q --show-progress https://dl.google.com/android/repository/android-ndk-r27d-linux.zip
+          unzip -q android-ndk-r27d 27.3.13750724 || true
+          if [ -d android-ndk-r27d ]; then mv android-ndk-r27d 27.3.13750724; fi
+
+      - name: Set up LLVM-MinGW ARM64EC toolchain
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/toolchains"
+          cd "$HOME/toolchains"
+          wget -q --show-progress https://github.com/bylaws/llvm-mingw/releases/download/20250920/llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64.tar.xz
+          tar -xf llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64.tar.xz
+
+      - name: Autogen Proton 11
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/proton-src"
+          bash build-scripts/build-step0-autogen.sh
+          test -x ./configure
+
+      - name: Build wine-tools
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/proton-src"
+          bash build-scripts/build-step0.sh
+          test -d wine-tools
+
+      - name: Configure ARM64EC SDK35 / 16KB
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/proton-src"
+          bash build-scripts/build-step-arm64ec.sh --build-sysvshm
+          bash build-scripts/build-step-arm64ec.sh --enable-16kb-pages --configure
+
+      - name: Build and install Proton 11 ARM64EC
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/proton-src"
+          bash build-scripts/build-step-arm64ec.sh --enable-16kb-pages --build
+          bash build-scripts/build-step-arm64ec.sh --enable-16kb-pages --install
+
+      - name: Verify traced EVR payload exists
+        run: |
+          set -euxo pipefail
+          OUTPUT_DIR="$HOME/compiled-files-aarch64"
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          find "$OUTPUT_DIR" -type f -iname 'evr*' -print | sort | tee "$GITHUB_WORKSPACE/out/evr-files.txt"
+          test "$(find "$OUTPUT_DIR" -type f -iname 'evr*' | wc -l)" -gt 0
+          find "$OUTPUT_DIR" -type f -iname 'evr*' -exec sha256sum {} \; | tee "$GITHUB_WORKSPACE/out/evr-sha256.txt"
+
+      - name: Download Proton 11 ARM64EC prefix pack
+        run: |
+          set -euxo pipefail
+          wget -q --show-progress \
+            https://github.com/GameNative/bionic-prefix-files/raw/main/prefixPack-arm64ec-11.txz \
+            -O "$GITHUB_WORKSPACE/prefixPack.txz"
+
+      - name: Package Bannerlator EVR trace WCP
+        run: |
+          set -euxo pipefail
+          OUTPUT_DIR="$HOME/compiled-files-aarch64"
+          cd "$OUTPUT_DIR"
+          cp "$GITHUB_WORKSPACE/prefixPack.txz" .
+          cat > profile.json <<'EOF'
+          {
+            "type": "Proton",
+            "versionName": "11.0.3.3-arm64ec",
+            "versionCode": 4,
+            "description": "OPPW4 EVR TRACE v3: Proton 11 ARM64EC SDK35/16KB. Logs actual DirectShow EVR sample subtype/data, allocator copy, mixer input/output and presenter notify as OPPW4TRACE in wine_debug.log.",
+            "files": [],
+            "wine": {
+              "binPath": "bin",
+              "libPath": "lib",
+              "prefixPack": "prefixPack.txz"
+            }
+          }
+          EOF
+          tar -I 'zstd -T0 -15' -cf "$GITHUB_WORKSPACE/out/proton-11.0.3.3-arm64ec-opppw4-evr-trace-sdk35.wcp" \
+            bin lib share prefixPack.txz profile.json
+          sha256sum "$GITHUB_WORKSPACE/out/proton-11.0.3.3-arm64ec-opppw4-evr-trace-sdk35.wcp" \
+            | tee "$GITHUB_WORKSPACE/out/wcp-sha256.txt"
+          ls -lh "$GITHUB_WORKSPACE/out/proton-11.0.3.3-arm64ec-opppw4-evr-trace-sdk35.wcp"
+
+      - name: Upload OPPW4 P11 EVR trace Proton
+        uses: actions/upload-artifact@v4
+        with:
+          name: opppw4-p11-evr-trace-v3-arm64ec-sdk35
+          path: |
+            out/proton-11.0.3.3-arm64ec-opppw4-evr-trace-sdk35.wcp
+            out/wcp-sha256.txt
+            out/evr-files.txt
+            out/evr-sha256.txt
+            p11-source-commit.txt
+            evr-trace-patch.txt
+          if-no-files-found: error
+          retention-days: 14

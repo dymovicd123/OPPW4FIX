@@ -235,14 +235,19 @@ jobs:
           bash build-scripts/build-step-arm64ec.sh --enable-16kb-pages --build
           bash build-scripts/build-step-arm64ec.sh --enable-16kb-pages --install
 
-      - name: Verify MF trace payload exists
+      - name: Verify MF/EVR trace payload exists
         run: |
           set -euxo pipefail
           OUTPUT_DIR="$HOME/compiled-files-aarch64"
           mkdir -p "$GITHUB_WORKSPACE/out"
-          find "$OUTPUT_DIR" -type f -iname 'mf*' -print | sort | tee "$GITHUB_WORKSPACE/out/mf-files.txt"
-          test "$(find "$OUTPUT_DIR" -type f -iname 'mf*' | wc -l)" -gt 0
-          find "$OUTPUT_DIR" -type f -iname 'mf*' -exec sha256sum {} \; | tee "$GITHUB_WORKSPACE/out/mf-sha256.txt"
+          find "$OUTPUT_DIR" \( -type f -o -type l \) \
+            \( -iname 'mf.dll' -o -iname 'evr.dll' -o -iname 'mfplat.dll' \) \
+            -print | sort | tee "$GITHUB_WORKSPACE/out/mf-files.txt"
+          MF_DLL="$(find "$OUTPUT_DIR" \( -type f -o -type l \) -iname 'mf.dll' -print -quit)"
+          EVR_DLL="$(find "$OUTPUT_DIR" \( -type f -o -type l \) -iname 'evr.dll' -print -quit)"
+          test -n "$MF_DLL"
+          test -n "$EVR_DLL"
+          sha256sum "$MF_DLL" "$EVR_DLL" | tee "$GITHUB_WORKSPACE/out/mf-sha256.txt"
 
       - name: Download Proton 11 ARM64EC prefix pack
         run: |

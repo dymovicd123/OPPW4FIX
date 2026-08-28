@@ -178,4 +178,19 @@ A separate waste source was found: `build-opppw4-sharedgpures-proton.yml` had an
 
 Temporary smoke workflow was removed after diagnosis.
 
-Current blocker: restore GitHub Actions entitlement (included minutes / budget / payment method) or move this build workload to a public repository or self-hosted runner. Once Actions accepts jobs again, run v4 and capture `OPPW4TRACE` from the real MF mixer/presenter path.
+The billing page confirmed `2000 / 2000` included Actions minutes used. The repository was then switched to public, after which the same v4 job immediately received a GitHub-hosted runner and completed successfully.
+
+### EVR mixer/presenter trace v4 — build success, first device capture INVALID
+
+Workflow: `.github/workflows/build-opppw4-p11-evr-trace-v4.yml`.
+
+Run `33120271314` completed successfully after the repository became public. Artifact `opppw4-p11-evr-trace-v4-arm64ec-sdk35` contains the real WCP:
+
+- expected WCP size: `108611183` bytes;
+- expected SHA-256: `f8da0c2c32729de7ba7abb25a739c2881c47e41fdc0f341a38bd19ddcc0d28ab`.
+
+The first WCP file handed to the device through ChatGPT was accidentally truncated locally to exactly `2621440` bytes and had SHA-256 `3d8a466730161591db821565c8486507ab74f728e43c61fe4c8f120cc80a6843`.
+
+Therefore the subsequent device log is **not a valid v4 result**. It contains no `OPPW4TRACE` markers, while DXVK 3.0.99 and the normal MF/DXVA2 initialization are visible, but that absence must not be interpreted until the full 108611183-byte WCP is installed.
+
+Next action: install the correctly extracted full WCP from the Actions artifact, keep `WINEDEBUG=+err`, reproduce the black cutscene for 5–10 seconds, then export a fresh `wine_debug.log` from Bannerlator Log Manager.

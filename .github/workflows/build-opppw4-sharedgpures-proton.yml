@@ -40,17 +40,24 @@ jobs:
           cd "$GITHUB_WORKSPACE/proton-src"
           git submodule status --recursive
           echo "SOURCE_COMMIT=$(git rev-parse HEAD)" | tee "$GITHUB_WORKSPACE/build-source.txt"
+          test -f dlls/sharedgpures.sys/shared_resource.c
+          test -f dlls/winedirectaudio.drv/directaudio.c
 
-      - name: Apply sharedgpures patches
+      - name: Apply sharedgpures PR 312 and 313 fixes
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/proton-src"
-          git fetch --no-tags https://github.com/The412Banner/proton-wine.git \
-            refs/pull/312/head:refs/remotes/origin/pr312 \
-            refs/pull/313/head:refs/remotes/origin/pr313
-          git cherry-pick refs/remotes/origin/pr312
-          git cherry-pick refs/remotes/origin/pr313
-          git log -3 --oneline | tee "$GITHUB_WORKSPACE/patched-source.txt"
+          curl -fL --retry 3 'https://github.com/avafloww/wine/commit/1c778c07af61870fb693d49c2b1b45ebff91384f.patch' -o /tmp/sharedgpures-312.patch
+          curl -fL --retry 3 'https://github.com/avafloww/wine/commit/63d1363133c17cbf63f75591cafc61484de54955.patch' -o /tmp/sharedgpures-313.patch
+          git apply --check /tmp/sharedgpures-312.patch
+          git apply /tmp/sharedgpures-312.patch
+          git apply --check /tmp/sharedgpures-313.patch
+          git apply /tmp/sharedgpures-313.patch
+          grep -q 'unix_resource_khandle' dlls/sharedgpures.sys/shared_resource.c
+          grep -q 'NtDuplicateObject(NtCurrentProcess(), kernel_handle, client_process' dlls/sharedgpures.sys/shared_resource.c
+          grep -q 'FsContext = (void \*)(UINT_PTR)-1' dlls/sharedgpures.sys/shared_resource.c
+          grep -q 'FsContext == (UINT_PTR)-1' dlls/sharedgpures.sys/shared_resource.c
+          git diff -- dlls/sharedgpures.sys/shared_resource.c | tee "$GITHUB_WORKSPACE/sharedgpures-applied.diff"
 
       - name: Download Termux ARM64 sysroot
         run: |
@@ -77,11 +84,11 @@ jobs:
           wget -q --show-progress https://github.com/bylaws/llvm-mingw/releases/download/20250920/llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64.tar.xz
           tar -xf llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64.tar.xz
 
-      - name: Autogen Proton 10
+      - name: Generate configure files
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/proton-src"
-          bash build-scripts/build-step0-autogen.sh
+          bash autogen.sh --aarch64
           test -x ./configure
 
       - name: Build wine-tools
@@ -105,25 +112,23 @@ jobs:
           bash build-scripts/build-step-arm64ec.sh --enable-16kb-pages --build
           bash build-scripts/build-step-arm64ec.sh --enable-16kb-pages --install
 
-      - name: Verify sharedgpures payload exists
+      - name: Locate and verify patched sharedgpures.sys
         run: |
           set -euxo pipefail
-          OUTPUT_DIR="$HOME/compiled-files-aarch64"
           mkdir -p "$GITHUB_WORKSPACE/out"
-          find "$OUTPUT_DIR" -type f \( -iname 'd3dkmt*' -o -iname 'win32u*' -o -iname 'ntdll*' \) -print | sort \
-            | tee "$GITHUB_WORKSPACE/out/sharedgpures-files.txt"
-          test "$(find "$OUTPUT_DIR" -type f \( -iname 'd3dkmt*' -o -iname 'win32u*' -o -iname 'ntdll*' \) | wc -l)" -gt 0
-          find "$OUTPUT_DIR" -type f \( -iname 'd3dkmt*' -o -iname 'win32u*' -o -iname 'ntdll*' \) -exec sha256sum {} \; \
-            | tee "$GITHUB_WORKSPACE/out/sharedgpures-sha256.txt"
+          DRIVER="$(find "$HOME/compiled-files-aarch64" "$GITHUB_WORKSPACE/proton-src" -type f -iname 'sharedgpures.sys' -print -quit)"
+          test -n "$DRIVER"
+          cp "$DRIVER" "$GITHUB_WORKSPACE/out/sharedgpures-patched-arm64ec.sys"
+          file "$DRIVER" | tee "$GITHUB_WORKSPACE/out/sharedgpures-file.txt"
+          sha256sum "$DRIVER" | tee "$GITHUB_WORKSPACE/out/sharedgpures-sha256.txt"
+          strings -a "$DRIVER" | grep -Ei 'sharedgpu|SharedGpuResource|NtDuplicateObject|kernel handle|resource' | head -200 | tee "$GITHUB_WORKSPACE/out/sharedgpures-strings.txt" || true
 
       - name: Download Proton 10 ARM64EC prefix pack
         run: |
           set -euxo pipefail
-          wget -q --show-progress \
-            https://github.com/GameNative/bionic-prefix-files/raw/main/prefixPack-arm64ec-10.txz \
-            -O "$GITHUB_WORKSPACE/prefixPack.txz"
+          wget -q --show-progress https://github.com/GameNative/bionic-prefix-files/raw/main/prefixPack-arm64ec.txz -O "$GITHUB_WORKSPACE/prefixPack.txz"
 
-      - name: Package Bannerlator WCP
+      - name: Package Bannerlator test WCP
         run: |
           set -euxo pipefail
           OUTPUT_DIR="$HOME/compiled-files-aarch64"
@@ -132,9 +137,9 @@ jobs:
           cat > profile.json <<'EOF'
           {
             "type": "Proton",
-            "versionName": "10.0.3.2-arm64ec",
-            "versionCode": 4,
-            "description": "OPPW4 sharedgpures diagnostic build: Proton 10 ARM64EC SDK35/16KB with The412Banner PR312+PR313 shared GPU-resource patches.",
+            "versionName": "10.0.4.313-arm64ec",
+            "versionCode": 9,
+            "description": "EXPERIMENTAL OPPW4 build: Proton 10.0-4 ARM64EC SDK35 with Valve sharedgpures PR 312 + 313 fixes. Boot-safe custom identifier for Bannerlator; keep separate from normal containers.",
             "files": [],
             "wine": {
               "binPath": "bin",
@@ -143,22 +148,33 @@ jobs:
             }
           }
           EOF
-          tar -I 'zstd -T0 -15' -cf "$GITHUB_WORKSPACE/out/proton-10.0.3.2-arm64ec-sharedgpures-sdk35.wcp" \
-            bin lib share prefixPack.txz profile.json
-          sha256sum "$GITHUB_WORKSPACE/out/proton-10.0.3.2-arm64ec-sharedgpures-sdk35.wcp" \
-            | tee "$GITHUB_WORKSPACE/out/wcp-sha256.txt"
-          ls -lh "$GITHUB_WORKSPACE/out/proton-10.0.3.2-arm64ec-sharedgpures-sdk35.wcp"
+          python3 - <<'PY'
+          import json, re
+          with open('profile.json', encoding='utf-8') as f:
+              p = json.load(f)
+          assert 0 <= p['versionCode'] <= 9, 'Bannerlator WineInfo strips exactly -<one digit> from content identifiers'
+          entry = f"{p['type']}-{p['versionName']}-{p['versionCode']}"
+          parsed = entry[:-2].lower()
+          boot_re = re.compile(r'^(wine|proton)\-([0-9\.]+)\-?([0-9\.]+)?\-(x86|x86_64|arm64ec)$')
+          assert boot_re.fullmatch(parsed), f'Bannerlator WineInfo boot regex rejects {parsed!r}'
+          print('Bannerlator boot identifier OK:', parsed)
+          PY
+          tar -I 'zstd -T0 -15' -cf "$GITHUB_WORKSPACE/out/proton-10.0-4-arm64ec-opppw4-sharedgpures-sdk35.wcp" bin lib share prefixPack.txz profile.json
+          sha256sum "$GITHUB_WORKSPACE/out/proton-10.0-4-arm64ec-opppw4-sharedgpures-sdk35.wcp" | tee "$GITHUB_WORKSPACE/out/wcp-sha256.txt"
+          ls -lh "$GITHUB_WORKSPACE/out/proton-10.0-4-arm64ec-opppw4-sharedgpures-sdk35.wcp"
 
-      - name: Upload sharedgpures Proton WCP
+      - name: Upload patched Proton WCP
         uses: actions/upload-artifact@v4
         with:
-          name: opppw4-sharedgpures-proton-arm64ec-sdk35
+          name: opppw4-patched-proton-arm64ec-sdk35
           path: |
-            out/proton-10.0.3.2-arm64ec-sharedgpures-sdk35.wcp
+            out/proton-10.0-4-arm64ec-opppw4-sharedgpures-sdk35.wcp
             out/wcp-sha256.txt
-            out/sharedgpures-files.txt
+            out/sharedgpures-patched-arm64ec.sys
+            out/sharedgpures-file.txt
             out/sharedgpures-sha256.txt
+            out/sharedgpures-strings.txt
+            sharedgpures-applied.diff
             build-source.txt
-            patched-source.txt
           if-no-files-found: error
           retention-days: 14

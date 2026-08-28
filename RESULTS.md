@@ -99,3 +99,83 @@ This pushes the fault higher into the real Wine EVR path. The remaining candidat
 4. EVR mixer -> presenter handoff / final presentation behavior.
 
 Next diagnostic should exercise the Wine DXVA2 device-manager/video-processor path and, ideally, the MF video sample allocator rather than another raw D3D9 `StretchRect` test.
+
+### DXVA2 / EVR processor verifier
+
+Focused verifier: `tests/dxva2_evr_processor_test.cpp`.
+
+Device result in the same Proton 11 + DXVK 3.0.99 container: **PASS_ALL**.
+
+- D3D9Ex device manager and `GetVideoService` succeeded.
+- Progressive DXVA2 video processor creation succeeded.
+- YUY2 source/output surface path, `VideoProcessBlt`, `StretchRect` and readback all succeeded; BGRA `185,185,185,255`.
+- NV12 source/output surface path, `VideoProcessBlt`, `StretchRect` and readback all succeeded; BGRA `214,214,214,255`.
+
+Conclusion: generic Wine DXVA2 video-processor operation is not fundamentally broken on this stack.
+
+### Actual OPPW4 WMV decoder output verifier
+
+Focused verifier: `tests/mf_decoder_output_test.cpp`.
+
+Tested the exact problem asset:
+
+`File/REGION/WW/Movie/JK035.wmv`
+
+Observed:
+
+- Native video subtype is I420 (`0x30323449`).
+- Native frame size is 1920x1080.
+- SourceReader successfully negotiates NV12 output.
+- First frame is flat black luma, as expected for the opening frame.
+- Subsequent decoded frames contain strongly changing image data; 300 of the next 300 samples were dynamic with changing hashes.
+- Final result: `DECODE_HAS_IMAGE_DATA`.
+
+Conclusion: the exact OPPW4 WMV asset decodes to real image data inside Wine/Media Foundation. Decoder output is not the black-screen cause.
+
+### EVR planar-negotiation rejection experiment
+
+Diagnostic Proton 11 build `11.0.3.2-arm64ec` changed `dlls/evr/evr.c` so DirectShow EVR input negotiation rejects I420/IYUV/YV12 and should force NV12/YUY2 when possible.
+
+Device result with DXVK 3.0.99:
+
+- Cutscene still starts.
+- Audio/subtitles still work.
+- Video remains black.
+
+Conclusion: the simple theory that OPPW4 connects I420 directly to `evr_render()` and hits its missing planar-copy branch is not sufficient.
+
+### Real-game EVR input trace v3b
+
+Diagnostic Proton 11 build `11.0.3.4-arm64ec` placed `ERR()` traces directly in DirectShow `evr_render()` / copy / mixer notification path.
+
+The Bannerlator `wine_debug.log` was captured with `WINEDEBUG=+err`.
+
+Result:
+
+- There are **zero** `OPPW4TRACE` records from `evr_render()`.
+- The game and `DXVK v3.0.99-arm64ec` are definitely active in the same log.
+- During video initialization the log repeatedly shows `mfplat:stream_handler_BeginCreateObject`, Proton/WineGStreamer activity, followed by DXVA2 `GetVideoProcessorDeviceGuids` and `CreateVideoProcessor` for the progressive processor GUID.
+
+Interpretation: OPPW4 is very likely not using the DirectShow `CLSID_EnhancedVideoRenderer -> evr_render()` wrapper path we instrumented. The more likely real path is direct Media Foundation use of `MFVideoMixer9` / `MFVideoPresenter9` plus DXVA2.
+
+Next trace target is therefore:
+
+`MF sample -> MFVideoMixer9 ProcessInput -> VideoProcessBlt -> MFVideoPresenter9 -> StretchRect -> SwapChain Present`
+
+Workflow prepared for this: `.github/workflows/build-opppw4-p11-evr-trace-v4.yml`.
+
+## 2026-08-28
+
+### GitHub Actions runner/billing blocker
+
+The v4 workflow failed before runner assignment. To distinguish a bad workflow from an account/runner problem, a temporary smoke workflow was created with only `runs-on: ubuntu-latest` and `echo runner-ok`.
+
+That trivial job also failed immediately with no steps and no assigned runner. At the same time GitHub's public status page reported Actions operational.
+
+This strongly indicates an account-side Actions usage/billing/budget block rather than a v4 YAML or Proton compile failure. The repository is private, so GitHub-hosted Actions consumes the account's included monthly minutes.
+
+A separate waste source was found: `build-opppw4-sharedgpures-proton.yml` had an unrestricted `push` trigger and therefore started a full Proton build on every commit. Its run number had already reached the mid-30s. The trigger has now been restricted to changes to that workflow itself plus manual `workflow_dispatch`, preventing future unrelated commits from launching expensive Proton 10 builds.
+
+Temporary smoke workflow was removed after diagnosis.
+
+Current blocker: restore GitHub Actions entitlement (included minutes / budget / payment method) or move this build workload to a public repository or self-hosted runner. Once Actions accepts jobs again, run v4 and capture `OPPW4TRACE` from the real MF mixer/presenter path.

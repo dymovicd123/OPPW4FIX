@@ -1,0 +1,291 @@
+name: Build OPPW4 Proton 11 session EVR sink trace v7
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-opppw4-p11-session-evr-trace-v7.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-arm64ec-sdk35:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h
+
+      - name: Install host build dependencies
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential git wget curl unzip xz-utils zstd file ccache \
+            flex bison gettext autoconf automake libtool pkg-config \
+            mingw-w64 gcc-multilib g++-multilib \
+            libfreetype6-dev libfreetype6-dev:i386 \
+            libpng-dev libpng-dev:i386 zlib1g-dev zlib1g-dev:i386
+
+      - name: Clone GE Proton 11 bionic source
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 --branch ge-proton11-bionic --recurse-submodules --shallow-submodules \
+            https://github.com/The412Banner/proton-wine.git "$GITHUB_WORKSPACE/proton-src"
+          cd "$GITHUB_WORKSPACE/proton-src"
+          git rev-parse HEAD | tee "$GITHUB_WORKSPACE/p11-source-commit.txt"
+
+      - name: Instrument MF session and EVR sink handoff
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/proton-src"
+          python3 - <<'PY'
+          from pathlib import Path
+
+          # ---- dlls/mf/session.c ----
+          p = Path('dlls/mf/session.c')
+          s = p.read_text()
+
+          sig = '''static void session_deliver_sample(struct media_session *session, IMFMediaStream *stream, const PROPVARIANT *value)\n{'''
+          pos = s.find(sig)
+          if pos < 0:
+              raise SystemExit('session_deliver_sample signature not found')
+          needle = '    DWORD input;\n'
+          n = s.find(needle, pos)
+          if n < 0:
+              raise SystemExit('session_deliver_sample declaration anchor not found')
+          insert = '''    static unsigned int oppw4_session_sample_count;\n    unsigned int oppw4_session_idx = ++oppw4_session_sample_count;\n'''
+          s = s[:n+len(needle)] + insert + s[n+len(needle):]
+
+          old = '''    if (!source_node)\n        return;\n\n    if (!value)\n        source_node->flags |= TOPO_NODE_END_OF_STREAM;'''
+          new = '''    if (!source_node)\n    {\n        if (oppw4_session_idx <= 100)\n            ERR("OPPW4TRACE SESSION_NO_SOURCE #%u stream=%p value=%p.\\n", oppw4_session_idx, stream, value);\n        return;\n    }\n\n    if (oppw4_session_idx <= 100)\n    {\n        DWORD oppw4_bytes = 0;\n        LONGLONG oppw4_time = -1, oppw4_dur = -1;\n        IMFSample *oppw4_sample = value ? (IMFSample *)value->punkVal : NULL;\n        if (oppw4_sample)\n        {\n            IMFSample_GetTotalLength(oppw4_sample, &oppw4_bytes);\n            IMFSample_GetSampleTime(oppw4_sample, &oppw4_time);\n            IMFSample_GetSampleDuration(oppw4_sample, &oppw4_dur);\n        }\n        ERR("OPPW4TRACE SESSION_SAMPLE #%u stream=%p src_node=%p node_id=%s sample=%p bytes=%lu time=%I64d dur=%I64d.\\n",\n                oppw4_session_idx, stream, source_node, wine_dbgstr_longlong(source_node->node_id),\n                oppw4_sample, oppw4_bytes, oppw4_time, oppw4_dur);\n    }\n\n    if (!value)\n        source_node->flags |= TOPO_NODE_END_OF_STREAM;'''
+          if old not in s:
+              raise SystemExit('session_deliver_sample source anchor not found')
+          s = s.replace(old, new, 1)
+
+          old = '''    if (!(node = session_get_topo_node_output(session, source_node, 0, &input)))\n    {\n        WARN("Failed to node %p/%u output.\\n", source_node, 0);\n        return;\n    }\n\n    session_deliver_sample_to_node(session, node, input, value ? (IMFSample *)value->punkVal : NULL);'''
+          new = '''    if (!(node = session_get_topo_node_output(session, source_node, 0, &input)))\n    {\n        WARN("Failed to node %p/%u output.\\n", source_node, 0);\n        return;\n    }\n\n    if (oppw4_session_idx <= 100)\n        ERR("OPPW4TRACE SESSION_ROUTE #%u src_node=%p src_id=%s -> node=%p type=%u node_id=%s input=%lu object=%p.\\n",\n                oppw4_session_idx, source_node, wine_dbgstr_longlong(source_node->node_id), node, node->type,\n                wine_dbgstr_longlong(node->node_id), input, node->object.object);\n\n    session_deliver_sample_to_node(session, node, input, value ? (IMFSample *)value->punkVal : NULL);'''
+          if old not in s:
+              raise SystemExit('session route anchor not found')
+          s = s.replace(old, new, 1)
+
+          sig = '''static void session_deliver_sample_to_node(struct media_session *session, struct topo_node *topo_node, unsigned int input,\n        IMFSample *sample)\n{'''
+          pos = s.find(sig)
+          if pos < 0:
+              raise SystemExit('session_deliver_sample_to_node signature not found')
+          needle = '    HRESULT hr;\n'
+          n = s.find(needle, pos)
+          if n < 0:
+              raise SystemExit('deliver_to_node declaration anchor not found')
+          insert = '''    static unsigned int oppw4_deliver_count;\n    unsigned int oppw4_deliver_idx = ++oppw4_deliver_count;\n    if (oppw4_deliver_idx <= 140)\n    {\n        DWORD oppw4_bytes = 0;\n        if (sample) IMFSample_GetTotalLength(sample, &oppw4_bytes);\n        ERR("OPPW4TRACE SESSION_DELIVER #%u node=%p type=%u node_id=%s object=%p input=%u sample=%p bytes=%lu.\\n",\n                oppw4_deliver_idx, topo_node, topo_node->type, wine_dbgstr_longlong(topo_node->node_id),\n                topo_node->object.object, input, sample, oppw4_bytes);\n    }\n'''
+          s = s[:n+len(needle)] + insert + s[n+len(needle):]
+
+          old = '''                    if (SUCCEEDED(hr = IMFStreamSink_ProcessSample(topo_node->object.sink_stream, sample)))\n                    {\n                        topo_node->u.sink.requests--;\n                    }\n                    else\n                    {\n                        WARN("Stream sink failed to process sample, hr %#lx.\\n", hr);\n                        IMFMediaEventQueue_QueueEventParamVar(session->event_queue, MEError, &GUID_NULL, hr, NULL);\n                    }'''
+          new = '''                    hr = IMFStreamSink_ProcessSample(topo_node->object.sink_stream, sample);\n                    if (oppw4_deliver_idx <= 140)\n                        ERR("OPPW4TRACE SESSION_SINK_PROCESS #%u sink=%p requests_before=%u hr=%#lx.\\n",\n                                oppw4_deliver_idx, topo_node->object.sink_stream, topo_node->u.sink.requests, hr);\n                    if (SUCCEEDED(hr))\n                    {\n                        topo_node->u.sink.requests--;\n                    }\n                    else\n                    {\n                        WARN("Stream sink failed to process sample, hr %#lx.\\n", hr);\n                        IMFMediaEventQueue_QueueEventParamVar(session->event_queue, MEError, &GUID_NULL, hr, NULL);\n                    }'''
+          if old not in s:
+              raise SystemExit('sink ProcessSample anchor not found')
+          s = s.replace(old, new, 1)
+
+          sig = '''static HRESULT transform_node_push_sample(const struct media_session *session, struct topo_node *topo_node,\n        UINT input, IMFSample *sample)\n{'''
+          pos = s.find(sig)
+          if pos < 0:
+              raise SystemExit('transform_node_push_sample signature not found')
+          old = '''        hr = IMFTransform_ProcessInput(transform, id, sample, 0);\n        if (hr == MF_E_NOTACCEPTING)\n            hr = transform_stream_push_sample(stream, sample);'''
+          new = '''        hr = IMFTransform_ProcessInput(transform, id, sample, 0);\n        {\n            static unsigned int oppw4_transform_input_count;\n            unsigned int oppw4_ti = ++oppw4_transform_input_count;\n            DWORD oppw4_bytes = 0;\n            IMFSample_GetTotalLength(sample, &oppw4_bytes);\n            if (oppw4_ti <= 120)\n                ERR("OPPW4TRACE SESSION_TRANSFORM_INPUT #%u node=%p node_id=%s transform=%p input=%u stream_id=%u bytes=%lu hr=%#lx.\\n",\n                        oppw4_ti, topo_node, wine_dbgstr_longlong(topo_node->node_id), transform, input, id, oppw4_bytes, hr);\n        }\n        if (hr == MF_E_NOTACCEPTING)\n            hr = transform_stream_push_sample(stream, sample);'''
+          tail = s[pos:]
+          if old not in tail:
+              raise SystemExit('transform ProcessInput anchor not found')
+          tail = tail.replace(old, new, 1)
+          s = s[:pos] + tail
+          p.write_text(s)
+
+          # ---- dlls/mf/evr.c ----
+          p = Path('dlls/mf/evr.c')
+          s = p.read_text()
+
+          sig = '''static HRESULT WINAPI video_stream_typehandler_SetCurrentMediaType(IMFMediaTypeHandler *iface, IMFMediaType *type)\n{'''
+          pos = s.find(sig)
+          if pos < 0:
+              raise SystemExit('SetCurrentMediaType signature not found')
+          old = '''    hr = IMFTransform_SetInputType(stream->parent->mixer, stream->id, type, 0);\n    if (SUCCEEDED(hr) && !stream->id)\n        hr = IMFVideoPresenter_ProcessMessage(stream->parent->presenter, MFVP_MESSAGE_INVALIDATEMEDIATYPE, 0);\n\n    return hr;'''
+          new = '''    {\n        GUID oppw4_subtype = {0};\n        UINT32 oppw4_w = 0, oppw4_h = 0;\n        IMFMediaType_GetGUID(type, &MF_MT_SUBTYPE, &oppw4_subtype);\n        MFGetAttributeSize((IMFAttributes *)type, &MF_MT_FRAME_SIZE, &oppw4_w, &oppw4_h);\n        hr = IMFTransform_SetInputType(stream->parent->mixer, stream->id, type, 0);\n        ERR("OPPW4TRACE MF_EVR_TYPE_SET stream=%p id=%u subtype=%s %ux%u mixer=%p hr=%#lx.\\n",\n                stream, stream->id, debugstr_guid(&oppw4_subtype), oppw4_w, oppw4_h, stream->parent->mixer, hr);\n    }\n    if (SUCCEEDED(hr) && !stream->id)\n    {\n        HRESULT oppw4_inv_hr = IMFVideoPresenter_ProcessMessage(stream->parent->presenter, MFVP_MESSAGE_INVALIDATEMEDIATYPE, 0);\n        ERR("OPPW4TRACE MF_EVR_TYPE_INVALIDATE stream=%p presenter=%p hr=%#lx.\\n",\n                stream, stream->parent->presenter, oppw4_inv_hr);\n        hr = oppw4_inv_hr;\n    }\n\n    return hr;'''
+          if old not in s:
+              raise SystemExit('SetCurrentMediaType body anchor not found')
+          s = s.replace(old, new, 1)
+
+          sig = '''static HRESULT WINAPI video_stream_sink_ProcessSample(IMFStreamSink *iface, IMFSample *sample)\n{'''
+          pos = s.find(sig)
+          if pos < 0:
+              raise SystemExit('video_stream_sink_ProcessSample signature not found')
+          needle = '    HRESULT hr = S_OK;\n'
+          n = s.find(needle, pos)
+          if n < 0:
+              raise SystemExit('ProcessSample declaration anchor not found')
+          insert = '''    static unsigned int oppw4_evr_sample_count;\n    unsigned int oppw4_evr_idx = ++oppw4_evr_sample_count;\n'''
+          s = s[:n+len(needle)] + insert + s[n+len(needle):]
+
+          old = '''    else if (stream->parent->state == EVR_STATE_RUNNING || stream->flags & EVR_STREAM_PREROLLING)\n    {\n        if (!(stream->flags & EVR_STREAM_STARTED))\n        {\n            IMFTransform_ProcessMessage(stream->parent->mixer, MFT_MESSAGE_NOTIFY_START_OF_STREAM, stream->id);\n            stream->flags |= EVR_STREAM_STARTED;\n        }\n\n        if (SUCCEEDED(IMFTransform_ProcessInput(stream->parent->mixer, stream->id, sample, 0)))\n        {\n            while ((hr = IMFVideoPresenter_ProcessMessage(stream->parent->presenter, MFVP_MESSAGE_PROCESSINPUTNOTIFY, 0)) == MF_E_TRANSFORM_TYPE_NOT_SET)\n            {\n                if (FAILED(hr = IMFVideoPresenter_ProcessMessage(stream->parent->presenter, MFVP_MESSAGE_INVALIDATEMEDIATYPE, 0)))\n                    break;\n            }\n        }'''
+          new = '''    else if (stream->parent->state == EVR_STATE_RUNNING || stream->flags & EVR_STREAM_PREROLLING)\n    {\n        DWORD oppw4_bytes = 0;\n        IMFSample_GetTotalLength(sample, &oppw4_bytes);\n        if (oppw4_evr_idx <= 100)\n            ERR("OPPW4TRACE MF_EVR_SAMPLE #%u stream=%p id=%u parent=%p state=%u flags=%#x sample=%p bytes=%lu time=%I64d mixer=%p presenter=%p.\\n",\n                    oppw4_evr_idx, stream, stream->id, stream->parent, stream->parent->state, stream->flags,\n                    sample, oppw4_bytes, timestamp, stream->parent->mixer, stream->parent->presenter);\n\n        if (!(stream->flags & EVR_STREAM_STARTED))\n        {\n            HRESULT oppw4_start_hr = IMFTransform_ProcessMessage(stream->parent->mixer, MFT_MESSAGE_NOTIFY_START_OF_STREAM, stream->id);\n            if (oppw4_evr_idx <= 100)\n                ERR("OPPW4TRACE MF_EVR_MIXER_START #%u hr=%#lx.\\n", oppw4_evr_idx, oppw4_start_hr);\n            stream->flags |= EVR_STREAM_STARTED;\n        }\n\n        {\n            HRESULT oppw4_mix_hr = IMFTransform_ProcessInput(stream->parent->mixer, stream->id, sample, 0);\n            if (oppw4_evr_idx <= 100)\n                ERR("OPPW4TRACE MF_EVR_MIXER_INPUT #%u hr=%#lx.\\n", oppw4_evr_idx, oppw4_mix_hr);\n            if (SUCCEEDED(oppw4_mix_hr))\n            {\n                unsigned int oppw4_retry = 0;\n                hr = IMFVideoPresenter_ProcessMessage(stream->parent->presenter, MFVP_MESSAGE_PROCESSINPUTNOTIFY, 0);\n                if (oppw4_evr_idx <= 100)\n                    ERR("OPPW4TRACE MF_EVR_PRESENTER_NOTIFY #%u retry=%u hr=%#lx.\\n", oppw4_evr_idx, oppw4_retry, hr);\n                while (hr == MF_E_TRANSFORM_TYPE_NOT_SET && oppw4_retry++ < 8)\n                {\n                    HRESULT oppw4_inv_hr = IMFVideoPresenter_ProcessMessage(stream->parent->presenter, MFVP_MESSAGE_INVALIDATEMEDIATYPE, 0);\n                    if (oppw4_evr_idx <= 100)\n                        ERR("OPPW4TRACE MF_EVR_PRESENTER_INVALIDATE #%u retry=%u hr=%#lx.\\n", oppw4_evr_idx, oppw4_retry, oppw4_inv_hr);\n                    if (FAILED(oppw4_inv_hr))\n                    {\n                        hr = oppw4_inv_hr;\n                        break;\n                    }\n                    hr = IMFVideoPresenter_ProcessMessage(stream->parent->presenter, MFVP_MESSAGE_PROCESSINPUTNOTIFY, 0);\n                    if (oppw4_evr_idx <= 100)\n                        ERR("OPPW4TRACE MF_EVR_PRESENTER_NOTIFY #%u retry=%u hr=%#lx.\\n", oppw4_evr_idx, oppw4_retry, hr);\n                }\n            }\n            else\n                hr = oppw4_mix_hr;\n        }'''
+          if old not in s:
+              raise SystemExit('ProcessSample processing anchor not found')
+          s = s.replace(old, new, 1)
+
+          # Log renderer initialization: whether game supplied custom mixer/presenter or defaults are created.
+          sig = '''static HRESULT WINAPI video_renderer_InitializeRenderer(IMFVideoRenderer *iface, IMFTransform *mixer,\n        IMFVideoPresenter *presenter)\n{'''
+          pos = s.find(sig)
+          if pos < 0:
+              raise SystemExit('InitializeRenderer signature not found')
+          needle = '    HRESULT hr;\n'
+          n = s.find(needle, pos)
+          if n < 0:
+              raise SystemExit('InitializeRenderer declaration anchor not found')
+          insert = '''    ERR("OPPW4TRACE MF_EVR_INITIALIZE renderer=%p supplied_mixer=%p supplied_presenter=%p.\\n", renderer, mixer, presenter);\n'''
+          s = s[:n+len(needle)] + insert + s[n+len(needle):]
+
+          # Replace default mixer/presenter CoCreateInstance returns with logged versions.
+          old = '''    return CoCreateInstance(&clsid, NULL, CLSCTX_INPROC_SERVER, &IID_IMFTransform, (void **)out);\n}'''
+          new = '''    hr = CoCreateInstance(&clsid, NULL, CLSCTX_INPROC_SERVER, &IID_IMFTransform, (void **)out);\n    ERR("OPPW4TRACE MF_EVR_CREATE_MIXER clsid=%s hr=%#lx out=%p.\\n", debugstr_guid(&clsid), hr, SUCCEEDED(hr) ? *out : NULL);\n    return hr;\n}'''
+          # Must be after video_renderer_create_mixer, first matching occurrence in that function.
+          pos = s.find('static HRESULT video_renderer_create_mixer(')
+          tail = s[pos:]
+          if old not in tail:
+              raise SystemExit('create_mixer return anchor not found')
+          tail = tail.replace(old, new, 1)
+          s = s[:pos] + tail
+
+          pos = s.find('static HRESULT video_renderer_create_presenter(')
+          old = '''    return CoCreateInstance(&clsid, NULL, CLSCTX_INPROC_SERVER, &IID_IMFVideoPresenter, (void **)out);\n}'''
+          new = '''    hr = CoCreateInstance(&clsid, NULL, CLSCTX_INPROC_SERVER, &IID_IMFVideoPresenter, (void **)out);\n    ERR("OPPW4TRACE MF_EVR_CREATE_PRESENTER clsid=%s window=%p hr=%#lx out=%p.\\n",\n            debugstr_guid(&clsid), renderer->window, hr, SUCCEEDED(hr) ? *out : NULL);\n    return hr;\n}'''
+          tail = s[pos:]
+          if old not in tail:
+              raise SystemExit('create_presenter return anchor not found')
+          tail = tail.replace(old, new, 1)
+          s = s[:pos] + tail
+
+          p.write_text(s)
+          PY
+
+          {
+            echo '=== session ==='
+            grep -n -A8 -B4 'OPPW4TRACE SESSION_ROUTE' dlls/mf/session.c
+            grep -n -A8 -B4 'OPPW4TRACE SESSION_SINK_PROCESS' dlls/mf/session.c
+            grep -n -A8 -B4 'OPPW4TRACE SESSION_TRANSFORM_INPUT' dlls/mf/session.c
+            echo '=== mf evr ==='
+            grep -n -A12 -B5 'OPPW4TRACE MF_EVR_SAMPLE' dlls/mf/evr.c
+            grep -n -A12 -B5 'OPPW4TRACE MF_EVR_PRESENTER_NOTIFY' dlls/mf/evr.c
+            grep -n -A8 -B4 'OPPW4TRACE MF_EVR_TYPE_SET' dlls/mf/evr.c
+            grep -n -A5 -B3 'OPPW4TRACE MF_EVR_CREATE_MIXER' dlls/mf/evr.c
+          } | tee "$GITHUB_WORKSPACE/session-evr-trace-v7-patch.txt"
+
+      - name: Download Termux ARM64 sysroot
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/termuxfs/aarch64"
+          cd "$HOME/termuxfs/aarch64"
+          wget -q --show-progress https://github.com/GameNative/termux-on-gha/releases/download/build-20260218/termuxfs-aarch64.tar
+          tar -xf termuxfs-aarch64.tar
+
+      - name: Set up Android NDK r27d
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/Android/Sdk/ndk"
+          cd "$HOME/Android/Sdk/ndk"
+          wget -q --show-progress https://dl.google.com/android/repository/android-ndk-r27d-linux.zip
+          unzip -q android-ndk-r27d-linux.zip
+          mv android-ndk-r27d 27.3.13750724
+
+      - name: Set up LLVM-MinGW ARM64EC toolchain
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/toolchains"
+          cd "$HOME/toolchains"
+          wget -q --show-progress https://github.com/bylaws/llvm-mingw/releases/download/20250920/llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64.tar.xz
+          tar -xf llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64.tar.xz
+
+      - name: Autogen Proton 11
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/proton-src"
+          bash build-scripts/build-step0-autogen.sh
+          test -x ./configure
+
+      - name: Build wine-tools
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/proton-src"
+          bash build-scripts/build-step0.sh
+          test -d wine-tools
+
+      - name: Configure ARM64EC SDK35 / 16KB
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/proton-src"
+          bash build-scripts/build-step-arm64ec.sh --build-sysvshm
+          bash build-scripts/build-step-arm64ec.sh --enable-16kb-pages --configure
+
+      - name: Build and install Proton 11 ARM64EC
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/proton-src"
+          bash build-scripts/build-step-arm64ec.sh --enable-16kb-pages --build
+          bash build-scripts/build-step-arm64ec.sh --enable-16kb-pages --install
+
+      - name: Verify MF trace payload exists
+        run: |
+          set -euxo pipefail
+          OUTPUT_DIR="$HOME/compiled-files-aarch64"
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          find "$OUTPUT_DIR" -type f -iname 'mf*' -print | sort | tee "$GITHUB_WORKSPACE/out/mf-files.txt"
+          test "$(find "$OUTPUT_DIR" -type f -iname 'mf*' | wc -l)" -gt 0
+          find "$OUTPUT_DIR" -type f -iname 'mf*' -exec sha256sum {} \; | tee "$GITHUB_WORKSPACE/out/mf-sha256.txt"
+
+      - name: Download Proton 11 ARM64EC prefix pack
+        run: |
+          set -euxo pipefail
+          wget -q --show-progress \
+            https://github.com/GameNative/bionic-prefix-files/raw/main/prefixPack-arm64ec-11.txz \
+            -O "$GITHUB_WORKSPACE/prefixPack.txz"
+
+      - name: Package Bannerlator session EVR trace WCP
+        run: |
+          set -euxo pipefail
+          OUTPUT_DIR="$HOME/compiled-files-aarch64"
+          cd "$OUTPUT_DIR"
+          cp "$GITHUB_WORKSPACE/prefixPack.txz" .
+          cat > profile.json <<'EOF'
+          {
+            "type": "Proton",
+            "versionName": "11.0.3.8-arm64ec",
+            "versionCode": 2,
+            "description": "OPPW4 TRACE v7: Proton 11 ARM64EC SDK35/16KB. Traces MF session routing and mf.dll EVR sink mixer/presenter handoff via OPPW4TRACE.",
+            "files": [],
+            "wine": {
+              "binPath": "bin",
+              "libPath": "lib",
+              "prefixPack": "prefixPack.txz"
+            }
+          }
+          EOF
+          tar -I 'zstd -T0 -15' -cf "$GITHUB_WORKSPACE/out/proton-11.0.3.8-arm64ec-opppw4-session-evr-trace-v7-sdk35.wcp" \
+            bin lib share prefixPack.txz profile.json
+          sha256sum "$GITHUB_WORKSPACE/out/proton-11.0.3.8-arm64ec-opppw4-session-evr-trace-v7-sdk35.wcp" | tee "$GITHUB_WORKSPACE/out/wcp-sha256.txt"
+          ls -lh "$GITHUB_WORKSPACE/out/proton-11.0.3.8-arm64ec-opppw4-session-evr-trace-v7-sdk35.wcp"
+
+      - name: Upload OPPW4 P11 session EVR trace v7 Proton
+        uses: actions/upload-artifact@v4
+        with:
+          name: opppw4-p11-session-evr-trace-v7-arm64ec-sdk35
+          path: |
+            out/proton-11.0.3.8-arm64ec-opppw4-session-evr-trace-v7-sdk35.wcp
+            out/wcp-sha256.txt
+            out/mf-files.txt
+            out/mf-sha256.txt
+            p11-source-commit.txt
+            session-evr-trace-v7-patch.txt
+          if-no-files-found: error
+          retention-days: 14

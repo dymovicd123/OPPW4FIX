@@ -1,0 +1,245 @@
+name: Build OPPW4 Proton 11 DXVA2 real frame trace v5
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-opppw4-p11-dxva2-trace-v5.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-arm64ec-sdk35:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h
+
+      - name: Install host build dependencies
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential git wget curl unzip xz-utils zstd file ccache \
+            flex bison gettext autoconf automake libtool pkg-config \
+            mingw-w64 gcc-multilib g++-multilib \
+            libfreetype6-dev libfreetype6-dev:i386 \
+            libpng-dev libpng-dev:i386 zlib1g-dev zlib1g-dev:i386
+
+      - name: Clone GE Proton 11 bionic source
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 --branch ge-proton11-bionic --recurse-submodules --shallow-submodules \
+            https://github.com/The412Banner/proton-wine.git "$GITHUB_WORKSPACE/proton-src"
+          cd "$GITHUB_WORKSPACE/proton-src"
+          git rev-parse HEAD | tee "$GITHUB_WORKSPACE/p11-source-commit.txt"
+
+      - name: Instrument DXVA2 real video surfaces
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/proton-src"
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('dlls/dxva2/main.c')
+          s = p.read_text()
+
+          # 1) We know this function is hit in the real OPPW4 log. Use it as an
+          # unmistakable proof that this exact patched dxva2.dll is executing.
+          sig = '''static HRESULT WINAPI device_manager_processor_service_CreateVideoProcessor(IDirectXVideoProcessorService *iface,\n        REFGUID device, const DXVA2_VideoDesc *video_desc, D3DFORMAT rt_format, UINT max_substreams,\n        IDirectXVideoProcessor **processor)\n{'''
+          pos = s.find(sig)
+          if pos < 0:
+              raise SystemExit('CreateVideoProcessor signature not found')
+          needle = '    struct video_processor *object;\n'
+          n = s.find(needle, pos)
+          if n < 0:
+              raise SystemExit('CreateVideoProcessor declaration anchor not found')
+          insert = '''    static unsigned int oppw4_create_processor_count;\n    unsigned int oppw4_proc_idx = ++oppw4_create_processor_count;\n    if (oppw4_proc_idx <= 20)\n        ERR("OPPW4TRACE DXVA_CREATE_PROCESSOR #%u device=%s rt_fmt=%#x max_substreams=%u desc=%p.\\n",\n                oppw4_proc_idx, debugstr_guid(device), rt_format, max_substreams, video_desc);\n'''
+          s = s[:n+len(needle)] + insert + s[n+len(needle):]
+
+          # 2) Trace every DXVA surface allocation. This tells us which format,
+          # pool and dimensions the real MF path actually requests.
+          sig = '''static HRESULT WINAPI device_manager_processor_service_CreateSurface(IDirectXVideoProcessorService *iface,\n        UINT width, UINT height, UINT backbuffers, D3DFORMAT format, D3DPOOL pool, DWORD usage, DWORD dxvaType,\n        IDirect3DSurface9 **surfaces, HANDLE *shared_handle)\n{'''
+          pos = s.find(sig)
+          if pos < 0:
+              raise SystemExit('CreateSurface signature not found')
+          needle = '    unsigned int i, j;\n'
+          n = s.find(needle, pos)
+          if n < 0:
+              raise SystemExit('CreateSurface declaration anchor not found')
+          insert = '''    static unsigned int oppw4_create_surface_count;\n    unsigned int oppw4_surface_idx = ++oppw4_create_surface_count;\n    if (oppw4_surface_idx <= 80)\n        ERR("OPPW4TRACE DXVA_CREATE_SURFACE_BEGIN #%u %ux%u backbuffers=%u fmt=%#x pool=%u usage=%#lx type=%lu shared=%p.\\n",\n                oppw4_surface_idx, width, height, backbuffers, format, pool, usage, dxvaType, shared_handle);\n'''
+          s = s[:n+len(needle)] + insert + s[n+len(needle):]
+
+          # Insert a result dump immediately before this function's final return.
+          ret = '    return hr;\n}'
+          r = s.find(ret, pos)
+          if r < 0:
+              raise SystemExit('CreateSurface return anchor not found')
+          insert = '''    if (oppw4_surface_idx <= 80)\n    {\n        ERR("OPPW4TRACE DXVA_CREATE_SURFACE_END #%u hr=%#lx.\\n", oppw4_surface_idx, hr);\n        if (SUCCEEDED(hr))\n        {\n            for (j = 0; j < backbuffers + 1; ++j)\n            {\n                D3DSURFACE_DESC oppw4_desc;\n                HRESULT oppw4_desc_hr = surfaces[j] ? IDirect3DSurface9_GetDesc(surfaces[j], &oppw4_desc) : E_POINTER;\n                ERR("OPPW4TRACE DXVA_SURFACE #%u.%u ptr=%p desc=%#lx fmt=%#x %ux%u pool=%u usage=%#lx.\\n",\n                        oppw4_surface_idx, j, surfaces[j], oppw4_desc_hr,\n                        SUCCEEDED(oppw4_desc_hr) ? oppw4_desc.Format : 0,\n                        SUCCEEDED(oppw4_desc_hr) ? oppw4_desc.Width : 0,\n                        SUCCEEDED(oppw4_desc_hr) ? oppw4_desc.Height : 0,\n                        SUCCEEDED(oppw4_desc_hr) ? oppw4_desc.Pool : 0,\n                        SUCCEEDED(oppw4_desc_hr) ? oppw4_desc.Usage : 0);\n            }\n        }\n    }\n'''
+          s = s[:r] + insert + s[r:]
+
+          # 3) Trace the exact real samples at the last confirmed stage from the
+          # user's log: Wine DXVA2 VideoProcessBlt.
+          sig = '''static HRESULT WINAPI video_processor_VideoProcessBlt(IDirectXVideoProcessor *iface, IDirect3DSurface9 *rt,\n        const DXVA2_VideoProcessBltParams *params, const DXVA2_VideoSample *samples, UINT sample_count,\n        HANDLE *complete_handle)\n{'''
+          pos = s.find(sig)
+          if pos < 0:
+              raise SystemExit('VideoProcessBlt signature not found')
+          needle = '    HRESULT hr;\n'
+          n = s.find(needle, pos)
+          if n < 0:
+              raise SystemExit('VideoProcessBlt declaration anchor not found')
+          insert = '''    static unsigned int oppw4_blt_count;\n    unsigned int oppw4_blt_idx = ++oppw4_blt_count;\n    D3DSURFACE_DESC oppw4_rt_desc;\n    HRESULT oppw4_rt_desc_hr = IDirect3DSurface9_GetDesc(rt, &oppw4_rt_desc);\n    if (oppw4_blt_idx <= 60)\n        ERR("OPPW4TRACE DXVA_BLT_BEGIN #%u samples=%u rt=%p desc=%#lx fmt=%#x %ux%u target=(%ld,%ld)-(%ld,%ld).\\n",\n                oppw4_blt_idx, sample_count, rt, oppw4_rt_desc_hr,\n                SUCCEEDED(oppw4_rt_desc_hr) ? oppw4_rt_desc.Format : 0,\n                SUCCEEDED(oppw4_rt_desc_hr) ? oppw4_rt_desc.Width : 0,\n                SUCCEEDED(oppw4_rt_desc_hr) ? oppw4_rt_desc.Height : 0,\n                params->TargetRect.left, params->TargetRect.top, params->TargetRect.right, params->TargetRect.bottom);\n'''
+          s = s[:n+len(needle)] + insert + s[n+len(needle):]
+
+          old = '''    IDirect3DDevice9_ColorFill(device, rt, &params->TargetRect, video_processor_get_background_color(&params->BackgroundColor));'''
+          new = '''    hr = IDirect3DDevice9_ColorFill(device, rt, &params->TargetRect,\n            video_processor_get_background_color(&params->BackgroundColor));\n    if (oppw4_blt_idx <= 60)\n        ERR("OPPW4TRACE DXVA_COLORFILL #%u hr=%#lx.\\n", oppw4_blt_idx, hr);'''
+          if old not in s:
+              raise SystemExit('ColorFill anchor not found')
+          s = s.replace(old, new, 1)
+
+          old = '''        dst_rect = params->TargetRect;\n\n        if (!intersect_rect(&dst_rect, &dst_rect, &samples[i].DstRect))\n            continue;\n\n        if (FAILED(hr = IDirect3DDevice9_StretchRect(device, samples[i].SrcSurface, &samples[i].SrcRect,\n                rt, &dst_rect, D3DTEXF_POINT)))\n        {\n            WARN("Failed to copy sample %u, hr %#lx.\\n", i, hr);\n        }'''
+          new = '''        dst_rect = params->TargetRect;\n\n        if (oppw4_blt_idx <= 60)\n        {\n            D3DSURFACE_DESC oppw4_src_desc;\n            D3DLOCKED_RECT oppw4_locked;\n            HRESULT oppw4_desc_hr = samples[i].SrcSurface ? IDirect3DSurface9_GetDesc(samples[i].SrcSurface, &oppw4_src_desc) : E_POINTER;\n            HRESULT oppw4_lock_hr = E_FAIL;\n            unsigned int oppw4_hash = 0, oppw4_nz = 0, oppw4_rows = 0, oppw4_cols = 0, oppw4_y, oppw4_x;\n\n            if (oppw4_blt_idx <= 30 && SUCCEEDED(oppw4_desc_hr))\n            {\n                oppw4_lock_hr = IDirect3DSurface9_LockRect(samples[i].SrcSurface, &oppw4_locked, NULL, D3DLOCK_READONLY);\n                if (SUCCEEDED(oppw4_lock_hr) && oppw4_locked.pBits && oppw4_locked.Pitch > 0)\n                {\n                    oppw4_rows = oppw4_src_desc.Height > 32 ? 32 : oppw4_src_desc.Height;\n                    oppw4_cols = (unsigned int)oppw4_locked.Pitch > 2048 ? 2048 : (unsigned int)oppw4_locked.Pitch;\n                    for (oppw4_y = 0; oppw4_y < oppw4_rows; ++oppw4_y)\n                    {\n                        const BYTE *oppw4_row = (const BYTE *)oppw4_locked.pBits + oppw4_y * oppw4_locked.Pitch;\n                        for (oppw4_x = 0; oppw4_x < oppw4_cols; oppw4_x += 67)\n                        {\n                            oppw4_hash = (oppw4_hash * 33u) ^ oppw4_row[oppw4_x];\n                            if (oppw4_row[oppw4_x]) ++oppw4_nz;\n                        }\n                    }\n                    IDirect3DSurface9_UnlockRect(samples[i].SrcSurface);\n                }\n            }\n\n            ERR("OPPW4TRACE DXVA_SAMPLE #%u.%u src=%p desc=%#lx fmt=%#x %ux%u pool=%u usage=%#lx lock=%#lx rows=%u cols=%u hash=%08x nz=%u srcRect=(%ld,%ld)-(%ld,%ld) dstRect=(%ld,%ld)-(%ld,%ld).\\n",\n                    oppw4_blt_idx, i, samples[i].SrcSurface, oppw4_desc_hr,\n                    SUCCEEDED(oppw4_desc_hr) ? oppw4_src_desc.Format : 0,\n                    SUCCEEDED(oppw4_desc_hr) ? oppw4_src_desc.Width : 0,\n                    SUCCEEDED(oppw4_desc_hr) ? oppw4_src_desc.Height : 0,\n                    SUCCEEDED(oppw4_desc_hr) ? oppw4_src_desc.Pool : 0,\n                    SUCCEEDED(oppw4_desc_hr) ? oppw4_src_desc.Usage : 0,\n                    oppw4_lock_hr, oppw4_rows, oppw4_cols, oppw4_hash, oppw4_nz,\n                    samples[i].SrcRect.left, samples[i].SrcRect.top, samples[i].SrcRect.right, samples[i].SrcRect.bottom,\n                    samples[i].DstRect.left, samples[i].DstRect.top, samples[i].DstRect.right, samples[i].DstRect.bottom);\n        }\n\n        if (!intersect_rect(&dst_rect, &dst_rect, &samples[i].DstRect))\n        {\n            if (oppw4_blt_idx <= 60)\n                ERR("OPPW4TRACE DXVA_SKIP_EMPTY #%u.%u target=(%ld,%ld)-(%ld,%ld) sampleDst=(%ld,%ld)-(%ld,%ld).\\n",\n                        oppw4_blt_idx, i, params->TargetRect.left, params->TargetRect.top,\n                        params->TargetRect.right, params->TargetRect.bottom, samples[i].DstRect.left,\n                        samples[i].DstRect.top, samples[i].DstRect.right, samples[i].DstRect.bottom);\n            continue;\n        }\n\n        hr = IDirect3DDevice9_StretchRect(device, samples[i].SrcSurface, &samples[i].SrcRect,\n                rt, &dst_rect, D3DTEXF_POINT);\n        if (oppw4_blt_idx <= 60)\n            ERR("OPPW4TRACE DXVA_STRETCH #%u.%u hr=%#lx finalDst=(%ld,%ld)-(%ld,%ld).\\n",\n                    oppw4_blt_idx, i, hr, dst_rect.left, dst_rect.top, dst_rect.right, dst_rect.bottom);\n        if (FAILED(hr))\n            WARN("Failed to copy sample %u, hr %#lx.\\n", i, hr);'''
+          if old not in s:
+              raise SystemExit('VideoProcessBlt loop anchor not found')
+          s = s.replace(old, new, 1)
+
+          old = '''    IDirect3DDevice9_Release(device);\n\n    return S_OK;'''
+          new = '''    if (oppw4_blt_idx <= 60)\n        ERR("OPPW4TRACE DXVA_BLT_END #%u returning=S_OK.\\n", oppw4_blt_idx);\n\n    IDirect3DDevice9_Release(device);\n\n    return S_OK;'''
+          # Replace only within/after the VideoProcessBlt function region.
+          tail = s[pos:]
+          if old not in tail:
+              raise SystemExit('VideoProcessBlt return anchor not found')
+          tail = tail.replace(old, new, 1)
+          s = s[:pos] + tail
+
+          p.write_text(s)
+          PY
+
+          {
+            grep -n -A8 -B4 'OPPW4TRACE DXVA_CREATE_PROCESSOR' dlls/dxva2/main.c
+            grep -n -A10 -B4 'OPPW4TRACE DXVA_CREATE_SURFACE_BEGIN' dlls/dxva2/main.c
+            grep -n -A16 -B6 'OPPW4TRACE DXVA_SAMPLE' dlls/dxva2/main.c
+            grep -n -A8 -B5 'OPPW4TRACE DXVA_STRETCH' dlls/dxva2/main.c
+          } | tee "$GITHUB_WORKSPACE/dxva2-trace-v5-patch.txt"
+
+      - name: Download Termux ARM64 sysroot
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/termuxfs/aarch64"
+          cd "$HOME/termuxfs/aarch64"
+          wget -q --show-progress https://github.com/GameNative/termux-on-gha/releases/download/build-20260218/termuxfs-aarch64.tar
+          tar -xf termuxfs-aarch64.tar
+
+      - name: Set up Android NDK r27d
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/Android/Sdk/ndk"
+          cd "$HOME/Android/Sdk/ndk"
+          wget -q --show-progress https://dl.google.com/android/repository/android-ndk-r27d-linux.zip
+          unzip -q android-ndk-r27d-linux.zip
+          mv android-ndk-r27d 27.3.13750724
+
+      - name: Set up LLVM-MinGW ARM64EC toolchain
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/toolchains"
+          cd "$HOME/toolchains"
+          wget -q --show-progress https://github.com/bylaws/llvm-mingw/releases/download/20250920/llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64.tar.xz
+          tar -xf llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64.tar.xz
+
+      - name: Autogen Proton 11
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/proton-src"
+          bash build-scripts/build-step0-autogen.sh
+          test -x ./configure
+
+      - name: Build wine-tools
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/proton-src"
+          bash build-scripts/build-step0.sh
+          test -d wine-tools
+
+      - name: Configure ARM64EC SDK35 / 16KB
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/proton-src"
+          bash build-scripts/build-step-arm64ec.sh --build-sysvshm
+          bash build-scripts/build-step-arm64ec.sh --enable-16kb-pages --configure
+
+      - name: Build and install Proton 11 ARM64EC
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/proton-src"
+          bash build-scripts/build-step-arm64ec.sh --enable-16kb-pages --build
+          bash build-scripts/build-step-arm64ec.sh --enable-16kb-pages --install
+
+      - name: Verify DXVA2 trace payload exists
+        run: |
+          set -euxo pipefail
+          OUTPUT_DIR="$HOME/compiled-files-aarch64"
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          find "$OUTPUT_DIR" -type f -iname 'dxva2.dll' -print | sort | tee "$GITHUB_WORKSPACE/out/dxva2-files.txt"
+          test "$(find "$OUTPUT_DIR" -type f -iname 'dxva2.dll' | wc -l)" -gt 0
+          find "$OUTPUT_DIR" -type f -iname 'dxva2.dll' -exec sha256sum {} \; | tee "$GITHUB_WORKSPACE/out/dxva2-sha256.txt"
+          while IFS= read -r f; do
+            echo "=== $f ==="
+            strings -a "$f" | grep 'OPPW4TRACE DXVA_' | head -40
+          done < "$GITHUB_WORKSPACE/out/dxva2-files.txt" | tee "$GITHUB_WORKSPACE/out/dxva2-trace-strings.txt"
+          grep -q 'OPPW4TRACE DXVA_BLT_BEGIN' "$GITHUB_WORKSPACE/out/dxva2-trace-strings.txt"
+          grep -q 'OPPW4TRACE DXVA_STRETCH' "$GITHUB_WORKSPACE/out/dxva2-trace-strings.txt"
+
+      - name: Download Proton 11 ARM64EC prefix pack
+        run: |
+          set -euxo pipefail
+          wget -q --show-progress \
+            https://github.com/GameNative/bionic-prefix-files/raw/main/prefixPack-arm64ec-11.txz \
+            -O "$GITHUB_WORKSPACE/prefixPack.txz"
+
+      - name: Package Bannerlator DXVA2 trace WCP
+        run: |
+          set -euxo pipefail
+          OUTPUT_DIR="$HOME/compiled-files-aarch64"
+          cd "$OUTPUT_DIR"
+          cp "$GITHUB_WORKSPACE/prefixPack.txz" .
+          cat > profile.json <<'EOF'
+          {
+            "type": "Proton",
+            "versionName": "11.0.3.6-arm64ec",
+            "versionCode": 3,
+            "description": "OPPW4 DXVA2 TRACE v5: Proton 11 ARM64EC SDK35/16KB. Traces the real DXVA2 CreateSurface/VideoProcessBlt source bytes, rectangles and StretchRect results via OPPW4TRACE.",
+            "files": [],
+            "wine": {
+              "binPath": "bin",
+              "libPath": "lib",
+              "prefixPack": "prefixPack.txz"
+            }
+          }
+          EOF
+          tar -I 'zstd -T0 -15' -cf "$GITHUB_WORKSPACE/out/proton-11.0.3.6-arm64ec-opppw4-dxva2-trace-v5-sdk35.wcp" \
+            bin lib share prefixPack.txz profile.json
+          sha256sum "$GITHUB_WORKSPACE/out/proton-11.0.3.6-arm64ec-opppw4-dxva2-trace-v5-sdk35.wcp" \
+            | tee "$GITHUB_WORKSPACE/out/wcp-sha256.txt"
+          ls -lh "$GITHUB_WORKSPACE/out/proton-11.0.3.6-arm64ec-opppw4-dxva2-trace-v5-sdk35.wcp"
+
+      - name: Upload OPPW4 P11 DXVA2 trace v5 Proton
+        uses: actions/upload-artifact@v4
+        with:
+          name: opppw4-p11-dxva2-trace-v5-arm64ec-sdk35
+          path: |
+            out/proton-11.0.3.6-arm64ec-opppw4-dxva2-trace-v5-sdk35.wcp
+            out/wcp-sha256.txt
+            out/dxva2-files.txt
+            out/dxva2-sha256.txt
+            out/dxva2-trace-strings.txt
+            p11-source-commit.txt
+            dxva2-trace-v5-patch.txt
+          if-no-files-found: error
+          retention-days: 14

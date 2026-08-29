@@ -240,14 +240,16 @@ jobs:
           set -euxo pipefail
           OUTPUT_DIR="$HOME/compiled-files-aarch64"
           mkdir -p "$GITHUB_WORKSPACE/out"
-          find "$OUTPUT_DIR" \( -type f -o -type l \) \
-            \( -iname 'mf.dll' -o -iname 'evr.dll' -o -iname 'mfplat.dll' \) \
+
+          # ARM64EC install names are not guaranteed to be exact mf.dll / evr.dll paths.
+          # Verify the installed payload by the trace strings compiled into dlls/mf.
+          find "$OUTPUT_DIR" -type f \( -iname 'mf*' -o -iname 'evr*' \) \
             -print | sort | tee "$GITHUB_WORKSPACE/out/mf-files.txt"
-          MF_DLL="$(find "$OUTPUT_DIR" \( -type f -o -type l \) -iname 'mf.dll' -print -quit)"
-          EVR_DLL="$(find "$OUTPUT_DIR" \( -type f -o -type l \) -iname 'evr.dll' -print -quit)"
-          test -n "$MF_DLL"
-          test -n "$EVR_DLL"
-          sha256sum "$MF_DLL" "$EVR_DLL" | tee "$GITHUB_WORKSPACE/out/mf-sha256.txt"
+          TRACE_PAYLOAD="$(grep -a -r -l -m1 'OPPW4TRACE SESSION_ROUTE' "$OUTPUT_DIR" | head -n1 || true)"
+          test -n "$TRACE_PAYLOAD"
+          grep -a -q 'OPPW4TRACE MF_EVR_SAMPLE' "$TRACE_PAYLOAD"
+          printf '%s\n' "$TRACE_PAYLOAD" | tee -a "$GITHUB_WORKSPACE/out/mf-files.txt"
+          sha256sum "$TRACE_PAYLOAD" | tee "$GITHUB_WORKSPACE/out/mf-sha256.txt"
 
       - name: Download Proton 11 ARM64EC prefix pack
         run: |

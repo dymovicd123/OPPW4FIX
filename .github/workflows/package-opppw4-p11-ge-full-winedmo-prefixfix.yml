@@ -1,0 +1,135 @@
+name: Package OPPW4 Proton 11 GE full winedmo prefix fix
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/package-opppw4-p11-ge-full-winedmo-prefixfix.yml'
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  package-prefixfix:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout OPPW4FIX
+        uses: actions/checkout@v4
+
+      - name: Download verified GE full base artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: opppw4-p11-ge-full-winedmo-arm64ec-sdk35
+          path: base-artifact
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: 33267305162
+
+      - name: Patch prefix registry and repack WCP
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y zstd xz-utils
+
+          BASE_WCP="$(find "$GITHUB_WORKSPACE/base-artifact" -type f -name '*.wcp' -print -quit)"
+          test -n "$BASE_WCP"
+          ROOT="$GITHUB_WORKSPACE/wcp-root"
+          PREFIX="$GITHUB_WORKSPACE/prefix-root"
+          VERIFY="$GITHUB_WORKSPACE/verify-prefix"
+          OUT="$GITHUB_WORKSPACE/out"
+          mkdir -p "$ROOT" "$PREFIX" "$VERIFY" "$OUT"
+
+          tar -I zstd -xf "$BASE_WCP" -C "$ROOT"
+          test -f "$ROOT/prefixPack.txz"
+          test -f "$ROOT/profile.json"
+          test -d "$ROOT/lib/wine"
+          test "$(find "$ROOT/lib/wine" -type f -iname 'winedmo*' | wc -l)" -ge 1
+          test "$(find "$ROOT/lib/wine" -type f -iname 'winegstreamer*' | wc -l)" -eq 0
+
+          tar -xf "$ROOT/prefixPack.txz" -C "$PREFIX"
+          test -f "$PREFIX/.wine/system.reg"
+
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ['GITHUB_WORKSPACE'])
+          reg = root / 'prefix-root/.wine/system.reg'
+          text = reg.read_text(errors='strict')
+          old = r'C:\\windows\\system32\\winegstreamer.dll'
+          new = r'C:\\windows\\system32\\winedmo.dll'
+          count = text.count(old)
+          print(f'old_winegstreamer_registrations={count}')
+          if count != 40:
+              raise SystemExit(f'expected exactly 40 winegstreamer registrations, found {count}')
+          text = text.replace(old, new)
+          if old in text:
+              raise SystemExit('stale winegstreamer registration remains')
+          reg.write_text(text)
+
+          profile_path = root / 'wcp-root/profile.json'
+          profile = json.loads(profile_path.read_text())
+          profile['versionName'] = '11.0.3.12-arm64ec'
+          profile['description'] = 'OPPW4 GE full video stack + prefix registration fix: winedmo + FFmpeg, WineGStreamer removed.'
+          profile_path.write_text(json.dumps(profile, ensure_ascii=False, indent=2) + '\n')
+          PY
+
+          rm -f "$ROOT/prefixPack.txz"
+          tar -cJf "$ROOT/prefixPack.txz" -C "$PREFIX" .
+
+          tar -xf "$ROOT/prefixPack.txz" -C "$VERIFY"
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          root = Path(os.environ['GITHUB_WORKSPACE'])
+          text = (root / 'verify-prefix/.wine/system.reg').read_text(errors='strict')
+          old = r'C:\\windows\\system32\\winegstreamer.dll'
+          new = r'C:\\windows\\system32\\winedmo.dll'
+          print('verified_old_refs=', text.count(old))
+          print('verified_winedmo_refs=', text.count(new))
+          if text.count(old) != 0:
+              raise SystemExit('winegstreamer registrations remain after prefix repack')
+          if text.count(new) != 40:
+              raise SystemExit('expected 40 winedmo registrations after prefix repack')
+          clsid = r'[Software\\Classes\\CLSID\\{62EE5DDB-4F52-48E2-8928-787B0253A0BC}\\InprocServer32]'
+          pos = text.find(clsid)
+          if pos < 0:
+              raise SystemExit('WMV decoder CLSID registration missing')
+          chunk = text[pos:pos+350]
+          if new not in chunk:
+              raise SystemExit('WMV decoder CLSID is not registered to winedmo.dll')
+          print('RESULT=PASS prefix-registry-fix')
+          PY
+
+          WCP="$OUT/proton-11.0.3.12-arm64ec-opppw4-ge-full-winedmo-prefixfix-sdk35.wcp"
+          tar -I 'zstd -T0 -15' -cf "$WCP" -C "$ROOT" bin lib share prefixPack.txz profile.json
+
+          sha256sum "$WCP" | tee "$OUT/wcp-sha256.txt"
+          ls -lh "$WCP" | tee "$OUT/wcp-size.txt"
+          tar -I zstd -tf "$WCP" | wc -l | tee "$OUT/wcp-entry-count.txt"
+          test "$(tar -I zstd -tf "$WCP" | grep -c '^lib/wine/')" -ge 100
+
+          {
+            echo 'RESULT=PASS package'
+            echo 'base_run=33267305162'
+            echo 'old_winegstreamer_registry_refs=0'
+            echo 'winedmo_registry_refs=40'
+            echo 'wmv_decoder_clsid={62EE5DDB-4F52-48E2-8928-787B0253A0BC}'
+            sha256sum "$WCP"
+          } | tee "$OUT/prefixfix-diagnostics.txt"
+
+      - name: Upload corrected Proton
+        uses: actions/upload-artifact@v4
+        with:
+          name: opppw4-p11-ge-full-winedmo-prefixfix-sdk35
+          path: |
+            out/proton-11.0.3.12-arm64ec-opppw4-ge-full-winedmo-prefixfix-sdk35.wcp
+            out/wcp-sha256.txt
+            out/wcp-size.txt
+            out/wcp-entry-count.txt
+            out/prefixfix-diagnostics.txt
+          if-no-files-found: error
+          retention-days: 14

@@ -1,0 +1,270 @@
+name: Build OPPW4 Proton 11 session EVR sink trace v7 FIXED
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-opppw4-p11-session-evr-trace-v7-fixed.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-arm64ec-sdk35:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout OPPW4FIX
+        uses: actions/checkout@v4
+
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h
+
+      - name: Install host build dependencies
+        run: |
+          set -euxo pipefail
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential git wget curl unzip xz-utils zstd file ccache \
+            flex bison gettext autoconf automake libtool pkg-config \
+            mingw-w64 gcc-multilib g++-multilib \
+            libfreetype6-dev libfreetype6-dev:i386 \
+            libpng-dev libpng-dev:i386 zlib1g-dev zlib1g-dev:i386
+
+      - name: Clone GE Proton 11 bionic source
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 --branch ge-proton11-bionic --recurse-submodules --shallow-submodules \
+            https://github.com/The412Banner/proton-wine.git "$GITHUB_WORKSPACE/proton-src"
+          cd "$GITHUB_WORKSPACE/proton-src"
+          git rev-parse HEAD | tee "$GITHUB_WORKSPACE/p11-source-commit.txt"
+
+      - name: Reuse and apply the exact v7 MF session EVR instrumentation
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import os
+          import textwrap
+          from pathlib import Path
+
+          root = Path(os.environ['GITHUB_WORKSPACE'])
+          workflow = root / '.github/workflows/build-opppw4-p11-session-evr-trace-v7.yml'
+          text = workflow.read_text()
+          begin = "          python3 - <<'PY'\n"
+          start = text.find(begin)
+          if start < 0:
+              raise SystemExit('v7 instrumentation heredoc start not found')
+          start += len(begin)
+          end = text.find('\n          PY\n', start)
+          if end < 0:
+              raise SystemExit('v7 instrumentation heredoc end not found')
+          script = textwrap.dedent(text[start:end])
+          out = root / 'apply-v7-instrumentation.py'
+          out.write_text(script)
+          print(f'extracted {len(script)} bytes of v7 instrumentation to {out}')
+          PY
+
+          cd "$GITHUB_WORKSPACE/proton-src"
+          python3 "$GITHUB_WORKSPACE/apply-v7-instrumentation.py"
+          grep -n -m1 'OPPW4TRACE SESSION_ROUTE' dlls/mf/session.c
+          grep -n -m1 'OPPW4TRACE MF_EVR_SAMPLE' dlls/mf/evr.c
+
+      - name: Download Termux ARM64 sysroot
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/termuxfs/aarch64"
+          cd "$HOME/termuxfs/aarch64"
+          wget -q --show-progress https://github.com/GameNative/termux-on-gha/releases/download/build-20260218/termuxfs-aarch64.tar
+          tar -xf termuxfs-aarch64.tar
+
+      - name: Set up Android NDK r27d
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/Android/Sdk/ndk"
+          cd "$HOME/Android/Sdk/ndk"
+          wget -q --show-progress https://dl.google.com/android/repository/android-ndk-r27d-linux.zip
+          unzip -q android-ndk-r27d-linux.zip
+          mv android-ndk-r27d 27.3.13750724
+
+      - name: Set up LLVM-MinGW ARM64EC toolchain
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/toolchains"
+          cd "$HOME/toolchains"
+          wget -q --show-progress https://github.com/bylaws/llvm-mingw/releases/download/20250920/llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64.tar.xz
+          tar -xf llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64.tar.xz
+
+      - name: Autogen Proton 11
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/proton-src"
+          bash build-scripts/build-step0-autogen.sh
+          test -x ./configure
+
+      - name: Build wine-tools
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/proton-src"
+          bash build-scripts/build-step0.sh
+          test -d wine-tools
+
+      - name: Configure ARM64EC SDK35 / 16KB
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/proton-src"
+          bash build-scripts/build-step-arm64ec.sh --build-sysvshm
+          bash build-scripts/build-step-arm64ec.sh --enable-16kb-pages --configure
+
+      - name: Build and install Proton 11 ARM64EC
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/proton-src"
+          bash build-scripts/build-step-arm64ec.sh --enable-16kb-pages --build
+          bash build-scripts/build-step-arm64ec.sh --enable-16kb-pages --install
+
+      - name: Reconstruct package from the real make-install tree and hard-verify v7 payload
+        run: |
+          set -euxo pipefail
+          INSTALL_DIR="$HOME/termuxfs/aarch64/data/data/com.termux/files/opt/wine"
+          OUTPUT_DIR="$HOME/compiled-files-aarch64"
+          PACKAGE_ROOT="$GITHUB_WORKSPACE/package-root"
+          DIAG="$GITHUB_WORKSPACE/v7-fixed-package-diagnostics.txt"
+
+          rm -rf "$PACKAGE_ROOT"
+          mkdir -p "$PACKAGE_ROOT" "$GITHUB_WORKSPACE/out"
+
+          {
+            echo "=== source trees ==="
+            echo "INSTALL_DIR=$INSTALL_DIR"
+            echo "OUTPUT_DIR=$OUTPUT_DIR"
+            du -sh "$INSTALL_DIR" "$OUTPUT_DIR" || true
+            echo
+            echo "=== install tree top ==="
+            find "$INSTALL_DIR" -maxdepth 3 -type d -print | sort | head -200
+          } | tee "$DIAG"
+
+          test -d "$INSTALL_DIR/bin"
+          test -d "$INSTALL_DIR/lib/wine"
+          test -d "$INSTALL_DIR/share/wine"
+
+          INSTALL_FILES="$(find -L "$INSTALL_DIR/lib/wine" -type f | wc -l)"
+          INSTALL_BYTES="$(du -sb "$INSTALL_DIR/lib/wine" | cut -f1)"
+          echo "install lib/wine files=$INSTALL_FILES bytes=$INSTALL_BYTES" | tee -a "$DIAG"
+
+          # A real Wine runtime contains hundreds of files and tens of MB at minimum.
+          # Fail here rather than ever publishing another tiny/empty WCP.
+          test "$INSTALL_FILES" -ge 100
+          test "$INSTALL_BYTES" -ge 50000000
+
+          cp -a "$INSTALL_DIR/bin" "$PACKAGE_ROOT/"
+          cp -a "$INSTALL_DIR/lib" "$PACKAGE_ROOT/"
+          cp -a "$INSTALL_DIR/share" "$PACKAGE_ROOT/"
+
+          PACKAGE_FILES="$(find -L "$PACKAGE_ROOT/lib/wine" -type f | wc -l)"
+          PACKAGE_BYTES="$(du -sb "$PACKAGE_ROOT/lib/wine" | cut -f1)"
+          echo "package lib/wine files=$PACKAGE_FILES bytes=$PACKAGE_BYTES" | tee -a "$DIAG"
+          test "$PACKAGE_FILES" -ge 100
+          test "$PACKAGE_BYTES" -ge 50000000
+          test -e "$PACKAGE_ROOT/bin/wine"
+
+          python3 - <<'PY' | tee -a "$GITHUB_WORKSPACE/v7-fixed-package-diagnostics.txt"
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ['GITHUB_WORKSPACE']) / 'package-root/lib/wine'
+          markers = {
+              b'OPPW4TRACE SESSION_ROUTE': None,
+              b'OPPW4TRACE MF_EVR_SAMPLE': None,
+          }
+
+          candidates = []
+          for pattern in ('mf.dll', 'mf*.dll', 'evr*.dll'):
+              candidates.extend(root.rglob(pattern))
+          seen = set()
+          candidates = [p for p in candidates if not (str(p) in seen or seen.add(str(p)))]
+
+          def scan(paths):
+              for path in paths:
+                  if not path.is_file():
+                      continue
+                  try:
+                      data = path.read_bytes()
+                  except OSError:
+                      continue
+                  for marker in markers:
+                      if markers[marker] is None and marker in data:
+                          markers[marker] = path
+                  if all(markers.values()):
+                      return True
+              return False
+
+          if not scan(candidates):
+              scan(root.rglob('*'))
+
+          for marker, path in markers.items():
+              print(f'{marker.decode()}: {path}')
+          missing = [m.decode() for m, p in markers.items() if p is None]
+          if missing:
+              raise SystemExit('missing required trace markers: ' + ', '.join(missing))
+          PY
+
+          echo "=== packaged mf/evr files ===" | tee -a "$DIAG"
+          find "$PACKAGE_ROOT/lib/wine" -type f \( -iname 'mf*' -o -iname 'evr*' \) -print | sort | tee -a "$DIAG"
+
+      - name: Download Proton 11 ARM64EC prefix pack
+        run: |
+          set -euxo pipefail
+          wget -q --show-progress \
+            https://github.com/GameNative/bionic-prefix-files/raw/main/prefixPack-arm64ec-11.txz \
+            -O "$GITHUB_WORKSPACE/prefixPack.txz"
+
+      - name: Package verified Bannerlator v7 FIXED WCP
+        run: |
+          set -euxo pipefail
+          PACKAGE_ROOT="$GITHUB_WORKSPACE/package-root"
+          WCP="$GITHUB_WORKSPACE/out/proton-11.0.3.9-arm64ec-opppw4-session-evr-trace-v7-FIXED-sdk35.wcp"
+
+          cp "$GITHUB_WORKSPACE/prefixPack.txz" "$PACKAGE_ROOT/prefixPack.txz"
+          cat > "$PACKAGE_ROOT/profile.json" <<'EOF'
+          {
+            "type": "Proton",
+            "versionName": "11.0.3.9-arm64ec",
+            "versionCode": 2,
+            "description": "OPPW4 TRACE v7 FIXED: Proton 11 ARM64EC SDK35/16KB. Full Wine runtime rebuilt from the verified make-install tree; traces MF session routing and MF EVR sink/mixer/presenter handoff via OPPW4TRACE.",
+            "files": [],
+            "wine": {
+              "binPath": "bin",
+              "libPath": "lib",
+              "prefixPack": "prefixPack.txz"
+            }
+          }
+          EOF
+
+          cd "$PACKAGE_ROOT"
+          tar -I 'zstd -T0 -15' -cf "$WCP" bin lib share prefixPack.txz profile.json
+          sha256sum "$WCP" | tee "$GITHUB_WORKSPACE/out/wcp-sha256.txt"
+          ls -lh "$WCP" | tee "$GITHUB_WORKSPACE/out/wcp-size.txt"
+          tar -I zstd -tf "$WCP" | wc -l | tee "$GITHUB_WORKSPACE/out/wcp-entry-count.txt"
+
+          # Final archive sanity gate: packaging cannot silently regress to an almost-empty tree.
+          test "$(tar -I zstd -tf "$WCP" | grep -c '^lib/wine/')" -ge 100
+
+      - name: Upload verified OPPW4 P11 session EVR trace v7 FIXED Proton
+        uses: actions/upload-artifact@v4
+        with:
+          name: opppw4-p11-session-evr-trace-v7-FIXED-arm64ec-sdk35
+          path: |
+            out/proton-11.0.3.9-arm64ec-opppw4-session-evr-trace-v7-FIXED-sdk35.wcp
+            out/wcp-sha256.txt
+            out/wcp-size.txt
+            out/wcp-entry-count.txt
+            p11-source-commit.txt
+            apply-v7-instrumentation.py
+            v7-fixed-package-diagnostics.txt
+          if-no-files-found: error
+          retention-days: 14

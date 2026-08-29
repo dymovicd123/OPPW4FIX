@@ -1,0 +1,205 @@
+name: Build OPPW4 Proton 11 GE full winedmo stack
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-opppw4-p11-ge-full-winedmo.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-arm64ec-sdk35:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout OPPW4FIX
+        uses: actions/checkout@v4
+
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+
+      - name: Install host build dependencies
+        run: |
+          set -euxo pipefail
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y build-essential git wget curl unzip xz-utils zstd file ccache flex bison gettext autoconf automake libtool pkg-config mingw-w64 gcc-multilib g++-multilib libfreetype6-dev libfreetype6-dev:i386 libpng-dev libpng-dev:i386 zlib1g-dev zlib1g-dev:i386
+
+      - name: Clone GE Proton 11 full video stack
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 --branch ge-full-stack --recurse-submodules --shallow-submodules https://github.com/The412Banner/proton-wine.git "$GITHUB_WORKSPACE/proton-src"
+          cd "$GITHUB_WORKSPACE/proton-src"
+          git rev-parse HEAD | tee "$GITHUB_WORKSPACE/p11-full-source-commit.txt"
+          test -d dlls/winedmo
+          test -f dlls/winedmo/video_decoder.c
+          test ! -d dlls/winegstreamer
+          grep -n '^MODULE.*winedmo.dll' dlls/winedmo/Makefile.in
+          grep -n -- '--with-ffmpeg' build-scripts/build-step-arm64ec.sh
+          grep -n -- '--without-gstreamer' build-scripts/build-step-arm64ec.sh
+
+      - name: Download Termux ARM64 sysroot
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/termuxfs/aarch64"
+          cd "$HOME/termuxfs/aarch64"
+          wget -q --show-progress https://github.com/GameNative/termux-on-gha/releases/download/build-20260218/termuxfs-aarch64.tar
+          tar -xf termuxfs-aarch64.tar
+
+      - name: Verify FFmpeg 8 runtime and development payload
+        run: |
+          set -euxo pipefail
+          DEPS="$HOME/termuxfs/aarch64/data/data/com.termux/files/usr"
+          find "$DEPS/include" -maxdepth 2 -type f \( -name avcodec.h -o -name avformat.h -o -name swscale.h -o -name swresample.h \) -print | sort | tee "$GITHUB_WORKSPACE/ffmpeg-headers.txt"
+          find "$DEPS/lib" -maxdepth 1 -type f \( -name 'libavcodec.so*' -o -name 'libavformat.so*' -o -name 'libavutil.so*' -o -name 'libswscale.so*' -o -name 'libswresample.so*' \) -print | sort | tee "$GITHUB_WORKSPACE/ffmpeg-libs.txt"
+          test "$(wc -l < "$GITHUB_WORKSPACE/ffmpeg-headers.txt")" -ge 4
+          test "$(wc -l < "$GITHUB_WORKSPACE/ffmpeg-libs.txt")" -ge 5
+
+      - name: Set up Android NDK r27d
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/Android/Sdk/ndk"
+          cd "$HOME/Android/Sdk/ndk"
+          wget -q --show-progress https://dl.google.com/android/repository/android-ndk-r27d-linux.zip
+          unzip -q android-ndk-r27d-linux.zip
+          mv android-ndk-r27d 27.3.13750724
+
+      - name: Set up LLVM-MinGW ARM64EC toolchain
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/toolchains"
+          cd "$HOME/toolchains"
+          wget -q --show-progress https://github.com/bylaws/llvm-mingw/releases/download/20250920/llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64.tar.xz
+          tar -xf llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64.tar.xz
+
+      - name: Autogen and build wine-tools
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/proton-src"
+          bash build-scripts/build-step0-autogen.sh
+          test -x ./configure
+          bash build-scripts/build-step0.sh
+          test -d wine-tools
+
+      - name: Configure ARM64EC SDK35 16KB full video stack
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/proton-src"
+          bash build-scripts/build-step-arm64ec.sh --build-sysvshm
+          bash build-scripts/build-step-arm64ec.sh --enable-16kb-pages --configure
+
+      - name: Build and install with compact failure diagnostics
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/proton-src"
+          FULL_LOG="$RUNNER_TEMP/opppw4-ge-full-build.log"
+          DIAG="$GITHUB_WORKSPACE/ge-full-build-diagnostics.txt"
+          : > "$FULL_LOG"
+          : > "$DIAG"
+          echo 'phase=build' >> "$DIAG"
+          if ! bash -e build-scripts/build-step-arm64ec.sh --enable-16kb-pages --build >"$FULL_LOG" 2>&1; then
+            echo 'RESULT=FAIL build' >> "$DIAG"
+            echo '=== last 180 build lines ===' >> "$DIAG"
+            tail -n 180 "$FULL_LOG" >> "$DIAG"
+            exit 1
+          fi
+          echo 'RESULT=PASS build' >> "$DIAG"
+          echo 'phase=install' >> "$DIAG"
+          if ! bash -e build-scripts/build-step-arm64ec.sh --enable-16kb-pages --install >>"$FULL_LOG" 2>&1; then
+            echo 'RESULT=FAIL install' >> "$DIAG"
+            echo '=== last 180 build/install lines ===' >> "$DIAG"
+            tail -n 180 "$FULL_LOG" >> "$DIAG"
+            exit 1
+          fi
+          echo 'RESULT=PASS install' >> "$DIAG"
+
+      - name: Verify real Wine tree and GE video stack
+        run: |
+          set -euo pipefail
+          INSTALL_DIR="$HOME/termuxfs/aarch64/data/data/com.termux/files/opt/wine"
+          PACKAGE_ROOT="$GITHUB_WORKSPACE/package-root"
+          DIAG="$GITHUB_WORKSPACE/ge-full-package-diagnostics.txt"
+          : > "$DIAG"
+          [ -d "$INSTALL_DIR/bin" ]
+          [ -d "$INSTALL_DIR/lib/wine" ]
+          [ -d "$INSTALL_DIR/share/wine" ]
+          FILES="$(find "$INSTALL_DIR/lib/wine" -type f | wc -l)"
+          BYTES="$(du -sb "$INSTALL_DIR/lib/wine" | cut -f1)"
+          echo "install_files=$FILES" | tee -a "$DIAG"
+          echo "install_bytes=$BYTES" | tee -a "$DIAG"
+          [ "$FILES" -ge 100 ]
+          [ "$BYTES" -ge 50000000 ]
+
+          WINEDMO_COUNT="$(find "$INSTALL_DIR/lib/wine" -type f -iname 'winedmo*' | wc -l)"
+          WG_COUNT="$(find "$INSTALL_DIR/lib/wine" -type f -iname 'winegstreamer*' | wc -l)"
+          echo "winedmo_files=$WINEDMO_COUNT" | tee -a "$DIAG"
+          echo "winegstreamer_files=$WG_COUNT" | tee -a "$DIAG"
+          find "$INSTALL_DIR/lib/wine" -type f -iname 'winedmo*' -print | sort | tee -a "$DIAG"
+          [ "$WINEDMO_COUNT" -ge 1 ]
+          [ "$WG_COUNT" -eq 0 ]
+
+          rm -rf "$PACKAGE_ROOT"
+          mkdir -p "$PACKAGE_ROOT" "$GITHUB_WORKSPACE/out"
+          cp -a "$INSTALL_DIR/bin" "$PACKAGE_ROOT/"
+          cp -a "$INSTALL_DIR/lib" "$PACKAGE_ROOT/"
+          cp -a "$INSTALL_DIR/share" "$PACKAGE_ROOT/"
+          [ -e "$PACKAGE_ROOT/bin/wine" ]
+          echo 'RESULT=PASS ge-full-winedmo-payload' | tee -a "$DIAG"
+
+      - name: Upload compact GE full diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: opppw4-p11-ge-full-winedmo-diagnostics
+          path: |
+            ge-full-build-diagnostics.txt
+            ge-full-package-diagnostics.txt
+            p11-full-source-commit.txt
+            ffmpeg-headers.txt
+            ffmpeg-libs.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Package Bannerlator GE full WCP
+        run: |
+          set -euxo pipefail
+          PACKAGE_ROOT="$GITHUB_WORKSPACE/package-root"
+          WCP="$GITHUB_WORKSPACE/out/proton-11.0.3.11-arm64ec-opppw4-ge-full-winedmo-sdk35.wcp"
+          wget -q --show-progress https://github.com/GameNative/bionic-prefix-files/raw/main/prefixPack-arm64ec-11.txz -O "$PACKAGE_ROOT/prefixPack.txz"
+          cat > "$PACKAGE_ROOT/profile.json" <<'EOF'
+          {
+            "type": "Proton",
+            "versionName": "11.0.3.11-arm64ec",
+            "versionCode": 2,
+            "description": "OPPW4 GE full video stack: Proton 11 ARM64EC SDK35/16KB, winedmo + FFmpeg, WineGStreamer removed.",
+            "files": [],
+            "wine": {"binPath":"bin","libPath":"lib","prefixPack":"prefixPack.txz"}
+          }
+          EOF
+          cd "$PACKAGE_ROOT"
+          tar -I 'zstd -T0 -15' -cf "$WCP" bin lib share prefixPack.txz profile.json
+          sha256sum "$WCP" | tee "$GITHUB_WORKSPACE/out/wcp-sha256.txt"
+          ls -lh "$WCP" | tee "$GITHUB_WORKSPACE/out/wcp-size.txt"
+          tar -I zstd -tf "$WCP" | wc -l | tee "$GITHUB_WORKSPACE/out/wcp-entry-count.txt"
+          test "$(tar -I zstd -tf "$WCP" | grep -c '^lib/wine/')" -ge 100
+
+      - name: Upload verified GE full Proton
+        uses: actions/upload-artifact@v4
+        with:
+          name: opppw4-p11-ge-full-winedmo-arm64ec-sdk35
+          path: |
+            out/proton-11.0.3.11-arm64ec-opppw4-ge-full-winedmo-sdk35.wcp
+            out/wcp-sha256.txt
+            out/wcp-size.txt
+            out/wcp-entry-count.txt
+            ge-full-build-diagnostics.txt
+            ge-full-package-diagnostics.txt
+            p11-full-source-commit.txt
+            ffmpeg-headers.txt
+            ffmpeg-libs.txt
+          if-no-files-found: error
+          retention-days: 14

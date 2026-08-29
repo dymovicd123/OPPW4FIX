@@ -120,7 +120,7 @@ jobs:
           bash build-scripts/build-step-arm64ec.sh --build-sysvshm
           bash build-scripts/build-step-arm64ec.sh --enable-16kb-pages --configure
 
-      - name: Build and install Proton 11 ARM64EC with compact failure diagnostics
+      - name: Build and install Proton 11 ARM64EC with strict install failure capture
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE/proton-src"
@@ -131,11 +131,11 @@ jobs:
           : > "$BUILD_DIAG"
 
           echo "phase=build" >> "$BUILD_DIAG"
-          if ! bash build-scripts/build-step-arm64ec.sh --enable-16kb-pages --build >"$FULL_LOG" 2>&1; then
+          if ! bash -e build-scripts/build-step-arm64ec.sh --enable-16kb-pages --build >"$FULL_LOG" 2>&1; then
             {
               echo "RESULT=FAIL build"
-              echo "=== last 160 build lines ==="
-              tail -n 160 "$FULL_LOG"
+              echo "=== last 180 build lines ==="
+              tail -n 180 "$FULL_LOG"
             } >> "$BUILD_DIAG"
             cat "$BUILD_DIAG"
             exit 1
@@ -143,11 +143,11 @@ jobs:
           echo "RESULT=PASS build" >> "$BUILD_DIAG"
 
           echo "phase=install" >> "$BUILD_DIAG"
-          if ! bash build-scripts/build-step-arm64ec.sh --enable-16kb-pages --install >>"$FULL_LOG" 2>&1; then
+          if ! bash -e build-scripts/build-step-arm64ec.sh --enable-16kb-pages --install >>"$FULL_LOG" 2>&1; then
             {
               echo "RESULT=FAIL install"
-              echo "=== last 160 build/install lines ==="
-              tail -n 160 "$FULL_LOG"
+              echo "=== last 180 build/install lines ==="
+              tail -n 180 "$FULL_LOG"
             } >> "$BUILD_DIAG"
             cat "$BUILD_DIAG"
             exit 1
@@ -327,8 +327,6 @@ jobs:
           sha256sum "$WCP" | tee "$GITHUB_WORKSPACE/out/wcp-sha256.txt"
           ls -lh "$WCP" | tee "$GITHUB_WORKSPACE/out/wcp-size.txt"
           tar -I zstd -tf "$WCP" | wc -l | tee "$GITHUB_WORKSPACE/out/wcp-entry-count.txt"
-
-          # Final archive sanity gate: packaging cannot silently regress to an almost-empty tree.
           test "$(tar -I zstd -tf "$WCP" | grep -c '^lib/wine/')" -ge 100
 
       - name: Upload verified OPPW4 P11 session EVR trace v7 FIXED Proton

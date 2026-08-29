@@ -64,9 +64,26 @@ jobs:
           if end < 0:
               raise SystemExit('v7 instrumentation heredoc end not found')
           script = textwrap.dedent(text[start:end])
+
+          # v7 originally used the Windows SDK helper MFGetAttributeSize(), but this
+          # Wine tree does not declare/implement that helper. Read MF_MT_FRAME_SIZE
+          # directly through IMFAttributes instead: width is high 32 bits, height low.
+          old = '        MFGetAttributeSize((IMFAttributes *)type, &MF_MT_FRAME_SIZE, &oppw4_w, &oppw4_h);'
+          new = '''        {
+              UINT64 oppw4_frame_size = 0;
+              if (SUCCEEDED(IMFMediaType_GetUINT64(type, &MF_MT_FRAME_SIZE, &oppw4_frame_size)))
+              {
+                  oppw4_w = (UINT32)(oppw4_frame_size >> 32);
+                  oppw4_h = (UINT32)oppw4_frame_size;
+              }
+          }'''
+          if old not in script:
+              raise SystemExit('v7 MFGetAttributeSize trace line not found')
+          script = script.replace(old, new, 1)
+
           out = root / 'apply-v7-instrumentation.py'
           out.write_text(script)
-          print(f'extracted {len(script)} bytes of v7 instrumentation to {out}')
+          print(f'extracted and corrected {len(script)} bytes of v7 instrumentation to {out}')
           PY
 
           cd "$GITHUB_WORKSPACE/proton-src"
@@ -120,7 +137,7 @@ jobs:
           bash build-scripts/build-step-arm64ec.sh --build-sysvshm
           bash build-scripts/build-step-arm64ec.sh --enable-16kb-pages --configure
 
-      - name: Build and install Proton 11 ARM64EC with strict install failure capture
+      - name: Build and install Proton 11 ARM64EC with strict failure capture
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE/proton-src"

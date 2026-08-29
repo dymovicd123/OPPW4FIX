@@ -120,59 +120,113 @@ jobs:
           bash build-scripts/build-step-arm64ec.sh --build-sysvshm
           bash build-scripts/build-step-arm64ec.sh --enable-16kb-pages --configure
 
-      - name: Build and install Proton 11 ARM64EC
+      - name: Build and install Proton 11 ARM64EC with compact failure diagnostics
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           cd "$GITHUB_WORKSPACE/proton-src"
-          bash build-scripts/build-step-arm64ec.sh --enable-16kb-pages --build
-          bash build-scripts/build-step-arm64ec.sh --enable-16kb-pages --install
 
-      - name: Reconstruct package from the real make-install tree and hard-verify v7 payload
+          FULL_LOG="$RUNNER_TEMP/opppw4-v7-build-full.log"
+          BUILD_DIAG="$GITHUB_WORKSPACE/v7-build-diagnostics.txt"
+          : > "$FULL_LOG"
+          : > "$BUILD_DIAG"
+
+          echo "phase=build" >> "$BUILD_DIAG"
+          if ! bash build-scripts/build-step-arm64ec.sh --enable-16kb-pages --build >"$FULL_LOG" 2>&1; then
+            {
+              echo "RESULT=FAIL build"
+              echo "=== last 160 build lines ==="
+              tail -n 160 "$FULL_LOG"
+            } >> "$BUILD_DIAG"
+            cat "$BUILD_DIAG"
+            exit 1
+          fi
+          echo "RESULT=PASS build" >> "$BUILD_DIAG"
+
+          echo "phase=install" >> "$BUILD_DIAG"
+          if ! bash build-scripts/build-step-arm64ec.sh --enable-16kb-pages --install >>"$FULL_LOG" 2>&1; then
+            {
+              echo "RESULT=FAIL install"
+              echo "=== last 160 build/install lines ==="
+              tail -n 160 "$FULL_LOG"
+            } >> "$BUILD_DIAG"
+            cat "$BUILD_DIAG"
+            exit 1
+          fi
+          echo "RESULT=PASS install" >> "$BUILD_DIAG"
+          echo "Build/install completed; full compiler log intentionally kept out of Actions output."
+
+      - name: Verify installed Wine tree
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           INSTALL_DIR="$HOME/termuxfs/aarch64/data/data/com.termux/files/opt/wine"
           OUTPUT_DIR="$HOME/compiled-files-aarch64"
-          PACKAGE_ROOT="$GITHUB_WORKSPACE/package-root"
           DIAG="$GITHUB_WORKSPACE/v7-fixed-package-diagnostics.txt"
 
-          rm -rf "$PACKAGE_ROOT"
-          mkdir -p "$PACKAGE_ROOT" "$GITHUB_WORKSPACE/out"
+          : > "$DIAG"
+          fail() {
+            echo "RESULT=FAIL $*" | tee -a "$DIAG"
+            exit 1
+          }
 
           {
-            echo "=== source trees ==="
+            echo "phase=install-tree"
             echo "INSTALL_DIR=$INSTALL_DIR"
             echo "OUTPUT_DIR=$OUTPUT_DIR"
             du -sh "$INSTALL_DIR" "$OUTPUT_DIR" || true
-            echo
-            echo "=== install tree top ==="
-            find "$INSTALL_DIR" -maxdepth 3 -type d -print | sort | head -200
-          } | tee "$DIAG"
+          } | tee -a "$DIAG"
 
-          test -d "$INSTALL_DIR/bin"
-          test -d "$INSTALL_DIR/lib/wine"
-          test -d "$INSTALL_DIR/share/wine"
+          [ -d "$INSTALL_DIR/bin" ] || fail "missing $INSTALL_DIR/bin"
+          [ -d "$INSTALL_DIR/lib/wine" ] || fail "missing $INSTALL_DIR/lib/wine"
+          [ -d "$INSTALL_DIR/share/wine" ] || fail "missing $INSTALL_DIR/share/wine"
 
-          INSTALL_FILES="$(find -L "$INSTALL_DIR/lib/wine" -type f | wc -l)"
+          INSTALL_FILES="$(find "$INSTALL_DIR/lib/wine" -type f -print | wc -l)"
           INSTALL_BYTES="$(du -sb "$INSTALL_DIR/lib/wine" | cut -f1)"
-          echo "install lib/wine files=$INSTALL_FILES bytes=$INSTALL_BYTES" | tee -a "$DIAG"
+          echo "install_files=$INSTALL_FILES" | tee -a "$DIAG"
+          echo "install_bytes=$INSTALL_BYTES" | tee -a "$DIAG"
 
-          # A real Wine runtime contains hundreds of files and tens of MB at minimum.
-          # Fail here rather than ever publishing another tiny/empty WCP.
-          test "$INSTALL_FILES" -ge 100
-          test "$INSTALL_BYTES" -ge 50000000
+          [ "$INSTALL_FILES" -ge 100 ] || fail "install tree has only $INSTALL_FILES files"
+          [ "$INSTALL_BYTES" -ge 50000000 ] || fail "install tree has only $INSTALL_BYTES bytes"
+
+          echo "RESULT=PASS install-tree" | tee -a "$DIAG"
+
+      - name: Reconstruct package from verified install tree
+        run: |
+          set -euo pipefail
+          INSTALL_DIR="$HOME/termuxfs/aarch64/data/data/com.termux/files/opt/wine"
+          PACKAGE_ROOT="$GITHUB_WORKSPACE/package-root"
+          DIAG="$GITHUB_WORKSPACE/v7-fixed-package-diagnostics.txt"
+
+          fail() {
+            echo "RESULT=FAIL $*" | tee -a "$DIAG"
+            exit 1
+          }
+
+          echo "phase=package-tree" | tee -a "$DIAG"
+          rm -rf "$PACKAGE_ROOT"
+          mkdir -p "$PACKAGE_ROOT" "$GITHUB_WORKSPACE/out"
 
           cp -a "$INSTALL_DIR/bin" "$PACKAGE_ROOT/"
           cp -a "$INSTALL_DIR/lib" "$PACKAGE_ROOT/"
           cp -a "$INSTALL_DIR/share" "$PACKAGE_ROOT/"
 
-          PACKAGE_FILES="$(find -L "$PACKAGE_ROOT/lib/wine" -type f | wc -l)"
+          PACKAGE_FILES="$(find "$PACKAGE_ROOT/lib/wine" -type f -print | wc -l)"
           PACKAGE_BYTES="$(du -sb "$PACKAGE_ROOT/lib/wine" | cut -f1)"
-          echo "package lib/wine files=$PACKAGE_FILES bytes=$PACKAGE_BYTES" | tee -a "$DIAG"
-          test "$PACKAGE_FILES" -ge 100
-          test "$PACKAGE_BYTES" -ge 50000000
-          test -e "$PACKAGE_ROOT/bin/wine"
+          echo "package_files=$PACKAGE_FILES" | tee -a "$DIAG"
+          echo "package_bytes=$PACKAGE_BYTES" | tee -a "$DIAG"
 
-          python3 - <<'PY' | tee -a "$GITHUB_WORKSPACE/v7-fixed-package-diagnostics.txt"
+          [ "$PACKAGE_FILES" -ge 100 ] || fail "package tree has only $PACKAGE_FILES files"
+          [ "$PACKAGE_BYTES" -ge 50000000 ] || fail "package tree has only $PACKAGE_BYTES bytes"
+          [ -e "$PACKAGE_ROOT/bin/wine" ] || fail "package-root/bin/wine is missing or broken"
+
+          echo "RESULT=PASS package-tree" | tee -a "$DIAG"
+
+      - name: Verify v7 trace markers in packaged runtime
+        run: |
+          set -euo pipefail
+          DIAG="$GITHUB_WORKSPACE/v7-fixed-package-diagnostics.txt"
+
+          echo "phase=trace-markers" | tee -a "$DIAG"
+          python3 - <<'PY' 2>&1 | tee -a "$DIAG"
           import os
           from pathlib import Path
 
@@ -185,8 +239,14 @@ jobs:
           candidates = []
           for pattern in ('mf.dll', 'mf*.dll', 'evr*.dll'):
               candidates.extend(root.rglob(pattern))
+
           seen = set()
-          candidates = [p for p in candidates if not (str(p) in seen or seen.add(str(p)))]
+          unique = []
+          for path in candidates:
+              key = str(path)
+              if key not in seen:
+                  seen.add(key)
+                  unique.append(path)
 
           def scan(paths):
               for path in paths:
@@ -203,18 +263,35 @@ jobs:
                       return True
               return False
 
-          if not scan(candidates):
+          if not scan(unique):
               scan(root.rglob('*'))
 
           for marker, path in markers.items():
-              print(f'{marker.decode()}: {path}')
+              print(f'{marker.decode()}={path}')
+
           missing = [m.decode() for m, p in markers.items() if p is None]
           if missing:
-              raise SystemExit('missing required trace markers: ' + ', '.join(missing))
+              print('RESULT=FAIL missing trace markers: ' + ', '.join(missing))
+              raise SystemExit(1)
+
+          print('RESULT=PASS trace-markers')
           PY
 
           echo "=== packaged mf/evr files ===" | tee -a "$DIAG"
-          find "$PACKAGE_ROOT/lib/wine" -type f \( -iname 'mf*' -o -iname 'evr*' \) -print | sort | tee -a "$DIAG"
+          find "$GITHUB_WORKSPACE/package-root/lib/wine" -type f \( -iname 'mf*' -o -iname 'evr*' \) -print | sort | tee -a "$DIAG"
+
+      - name: Upload compact v7 diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: opppw4-p11-session-evr-trace-v7-diagnostics
+          path: |
+            v7-build-diagnostics.txt
+            v7-fixed-package-diagnostics.txt
+            p11-source-commit.txt
+            apply-v7-instrumentation.py
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Download Proton 11 ARM64EC prefix pack
         run: |
@@ -265,6 +342,7 @@ jobs:
             out/wcp-entry-count.txt
             p11-source-commit.txt
             apply-v7-instrumentation.py
+            v7-build-diagnostics.txt
             v7-fixed-package-diagnostics.txt
           if-no-files-found: error
           retention-days: 14
